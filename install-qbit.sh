@@ -384,6 +384,12 @@ mkdir -p "\${DATA_DIR}/setup"
 export QBIT_HERMES_SETUP_UI_DIR="\${SETUP_UI_DIR}"
 export QBIT_HERMES_LOCAL_API_BIND="\${BIND_ADDRESS}"
 
+# Point the Phase 3 provisioner at user-writable paths so the BYOH path (which
+# runs as the operator user, not root) can write the managed hermes CLI wrapper
+# and find the install hook without requiring root privileges.
+export QBIT_HERMES_CLI_BIN_PATH="\${HOME}/.local/bin/hermes"
+export QBIT_HERMES_INSTALL_HOOK_PATH="${INSTALL_DIR}/qbit-hermes-agent-install"
+
 echo "Starting qbit.me local setup server on http://\${BIND_ADDRESS}/"
 echo "Open that URL in your browser to complete setup. Press Ctrl+C to stop."
 
