@@ -319,7 +319,25 @@ download_artifacts() {
   download_to "${QBIT_RELEASE_BASE_URL%/}/setup-ui.tar.gz" "${WORK_DIR}/setup-ui.tar.gz"
   run mkdir -p "${WORK_DIR}/setup-ui"
   run tar -xzf "${WORK_DIR}/setup-ui.tar.gz" -C "${WORK_DIR}/setup-ui"
+  # Tarball layouts vary: some ship index.html at the top, others nest it under
+  # setup-ui/browser/. Resolve to the directory that actually contains
+  # index.html so the launcher's --setup-ui-dir points at a usable bundle.
+  local candidate
   SOURCE_UI_DIR="${WORK_DIR}/setup-ui"
+  if [[ ! -f "${SOURCE_UI_DIR}/index.html" ]]; then
+    for candidate in \
+        "${SOURCE_UI_DIR}/setup-ui/browser" \
+        "${SOURCE_UI_DIR}/browser" \
+        "${SOURCE_UI_DIR}/setup-ui"; do
+      if [[ -f "${candidate}/index.html" ]]; then
+        SOURCE_UI_DIR="${candidate}"
+        break
+      fi
+    done
+  fi
+  if [[ ! -f "${SOURCE_UI_DIR}/index.html" ]]; then
+    warn "Setup UI bundle did not contain index.html at a recognized path; browser flow may not serve."
+  fi
 }
 
 # ── Install setup UI bundle + launcher ────────────────────────────────────────
