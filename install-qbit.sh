@@ -16,14 +16,14 @@ set -euo pipefail
 #   3. Installs Hermes first only when it is not already present.
 #   4. Installs the qbit.me binaries around the (existing or freshly installed)
 #      Hermes install:
-#        - hb-local-api   (required)  serves the local web setup UI + API and
-#                                     embeds the hb-provisioner install/runtime
+#        - qbit-me-local-api   (required)  serves the local web setup UI + API and
+#                                     embeds the qbit-me-provisioner install/runtime
 #                                     engine (a linked library, not a separate
 #                                     binary)
-#        - hb-daemon      (required)  runtime health + cloud bridge
-#        - hb-ble         (optional)  only with --with-ble
+#        - qbit-me-daemon      (required)  runtime health + cloud bridge
+#        - qbit-me-ble         (optional)  only with --with-ble
 #   5. Installs the browser setup UI bundle and a `qbit-hermes-setup` launcher
-#      that serves it over http://127.0.0.1:8081 via hb-local-api.
+#      that serves it over http://127.0.0.1:8081 via qbit-me-local-api.
 #
 # It explicitly DOES NOT:
 #   - Touch or interfere with the mobile app + BLE onboarding path.
@@ -84,7 +84,7 @@ Options:
                            Falls back to ~/.local/bin if not writable.
   --setup-ui-dir <dir>     Where to install the browser setup UI bundle.
                            Default: <share>/setup-ui
-  --with-ble               Also install the optional hb-ble binary.
+  --with-ble               Also install the optional qbit-me-ble binary.
   --skip-hermes            Do not install Hermes even if it is missing.
   --hermes-install-url <u> Override the official Hermes installer URL.
   -y, --yes                Do not prompt for confirmation.
@@ -255,14 +255,14 @@ download_to() {
 }
 
 # ── Resolve binary set ────────────────────────────────────────────────────────
-# hb-provisioner is the install/runtime engine, but it is a library crate that
-# is statically linked into hb-local-api rather than a standalone binary, so the
-# installable binaries are hb-local-api (which embeds the provisioner) and
-# hb-daemon, plus the optional hb-ble.
-required_binaries=(hb-local-api hb-daemon)
+# qbit-me-provisioner is the install/runtime engine, but it is a library crate that
+# is statically linked into qbit-me-local-api rather than a standalone binary, so the
+# installable binaries are qbit-me-local-api (which embeds the provisioner) and
+# qbit-me-daemon, plus the optional qbit-me-ble.
+required_binaries=(qbit-me-local-api qbit-me-daemon)
 optional_binaries=()
 if [[ "${with_ble}" -eq 1 ]]; then
-  optional_binaries+=(hb-ble)
+  optional_binaries+=(qbit-me-ble)
 fi
 
 WORK_DIR=""
@@ -369,7 +369,7 @@ export QBIT_HERMES_LOCAL_API_BIND="\${BIND_ADDRESS}"
 echo "Starting qbit.me local setup server on http://\${BIND_ADDRESS}/"
 echo "Open that URL in your browser to complete setup. Press Ctrl+C to stop."
 
-exec "${INSTALL_DIR}/hb-local-api" \\
+exec "${INSTALL_DIR}/qbit-me-local-api" \\
   --bind "\${BIND_ADDRESS}" \\
   --setup-ui-dir "\${SETUP_UI_DIR}" \\
   --state-path "\${DATA_DIR}/bootstrap-state.json" \\
@@ -470,7 +470,7 @@ Next steps:
      and watch install progress in the browser.
 
 Installed binaries (in ${INSTALL_DIR}):
-  - hb-local-api (embeds the hb-provisioner install/runtime engine), hb-daemon$([[ ${with_ble} -eq 1 ]] && printf ', hb-ble')
+  - qbit-me-local-api (embeds the qbit-me-provisioner install/runtime engine), qbit-me-daemon$([[ ${with_ble} -eq 1 ]] && printf ', qbit-me-ble')
 
 Notes:
   - The mobile app + BLE onboarding path is unaffected by this installer.
