@@ -464,9 +464,44 @@ main() {
 
   install_setup_ui
   install_launcher
+  install_provisioner_hook
   echo
 
   print_post_install
+}
+
+# ── Install the default Phase 3 Hermes install hook ───────────────────────────
+# The qbit-me-provisioner needs a Hermes install command to invoke during the
+# "Install Hermes core" step. On the normal Pi appliance path this is pre-wired
+# via systemd env files. On the BYOH path we install a small hook script that
+# runs the official Hermes installer with --skip-setup --skip-browser so it
+# installs into the provisioner's managed runtime tree (the provisioner sets
+# HOME, HERMES_HOME, and HERMES_INSTALL_DIR env vars before invoking the hook).
+install_provisioner_hook() {
+  local hook_path="${INSTALL_DIR}/qbit-hermes-agent-install"
+  local tmp_hook="${WORK_DIR:-$(mktemp -d)}/qbit-hermes-agent-install"
+  cat > "${tmp_hook}" <<'HOOK_EOF'
+#!/usr/bin/env bash
+# qbit-hermes-agent-install — default Phase 3 Hermes install hook for BYOH
+#
+# The qbit-me-provisioner sets HOME, HERMES_HOME, HERMES_INSTALL_DIR, and
+# QBIT_HERMES_* env vars pointing at the managed runtime tree before invoking
+# this hook. We run the official Hermes installer with --skip-setup --skip-browser
+# so it installs into the managed tree without launching interactive setup.
+set -euo pipefail
+
+INSTALL_URL="${QBIT_HERMES_INSTALL_URL:-https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh}"
+
+if ! command -v curl >/dev/null 2>&1; then
+  echo "ERROR: curl is required to install Hermes into the managed runtime tree" >&2
+  exit 1
+fi
+
+curl -fsSL "${INSTALL_URL}" | bash -s -- --skip-setup --skip-browser
+HOOK_EOF
+  run chmod 0755 "${tmp_hook}"
+  run ${SUDO} install -m 0755 "${tmp_hook}" "${hook_path}"
+  ok "Provisioner install hook -> ${hook_path}"
 }
 
 print_post_install() {
