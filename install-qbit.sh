@@ -340,6 +340,84 @@ download_artifacts() {
   fi
 }
 
+# ── Install the Phase 3 provisioner hook ─────────────────────────────────────
+# The provisioner needs an executable hook that runs the official Hermes
+# installer into the managed runtime tree. On the normal Pi appliance path this
+# is pre-configured; on BYOH we install a default hook that pipes the official
+# installer through bash with --skip-setup --skip-browser.
+install_provisioner_hook() {
+  local hook="${INSTALL_DIR}/qbit-hermes-agent-install"
+  log "Installing provisioner hook ${hook}…"
+  local tmp_hook="${WORK_DIR:-$(mktemp -d)}/qbit-hermes-agent-install"
+  WORK_DIR="${WORK_DIR:-$(dirname "${tmp_hook}")}"
+  cat > "${tmp_hook}" <<'HOOKEOF'
+#!/usr/bin/env bash
+# qbit-hermes-agent-install — Phase 3 install hook for the BYOH path.
+#
+# The provisioner sets HOME, HERMES_HOME, HERMES_INSTALL_DIR, and QBIT_HERMES_*
+# env vars pointing at the managed runtime tree before invoking this hook.
+#
+# If Hermes is already installed system-wide, we create symlinks in the managed
+# runtime tree so the provisioner can find it. Otherwise we run the official
+# Hermes installer into the managed tree.
+set -euo pipefail
+
+echo "qbit-hermes-agent-install: starting"
+echo "  QBIT_HERMES_RUNTIME_ROOT=${QBIT_HERMES_RUNTIME_ROOT:-<unset>}"
+echo "  HERMES_HOME=${HERMES_HOME:-<unset>}"
+echo "  HERMES_INSTALL_DIR=${HERMES_INSTALL_DIR:-<unset>}"
+echo "  HOME=${HOME:-<unset>}"
+
+# ── Resolve the system Hermes binary ──────────────────────────────────────
+SYSTEM_HERMES=""
+for candidate in /usr/local/bin/hermes /usr/bin/hermes /opt/hermes/bin/hermes; do
+  if [[ -x "$candidate" ]]; then
+    SYSTEM_HERMES="$candidate"
+    break
+  fi
+done
+if [[ -z "$SYSTEM_HERMES" ]] && command -v hermes >/dev/null 2>&1; then
+  SYSTEM_HERMES="$(command -v hermes)"
+fi
+
+if [[ -n "$SYSTEM_HERMES" ]]; then
+  echo "qbit-hermes-agent-install: Hermes found at ${SYSTEM_HERMES}"
+
+  # Create symlinks in the managed runtime tree so the provisioner can find
+  # the binary at the paths it expects (runtime_local_bin_dir and
+  # runtime_install_dir/venv/bin).
+  RUNTIME_ROOT="${QBIT_HERMES_RUNTIME_ROOT}"
+  if [[ -n "$RUNTIME_ROOT" ]]; then
+    mkdir -p "$RUNTIME_ROOT/.local/bin"
+    mkdir -p "$RUNTIME_ROOT/hermes-agent/venv/bin"
+    ln -sf "$SYSTEM_HERMES" "$RUNTIME_ROOT/.local/bin/hermes"
+    ln -sf "$SYSTEM_HERMES" "$RUNTIME_ROOT/hermes-agent/venv/bin/hermes"
+    echo "Symlinks created in $RUNTIME_ROOT"
+  fi
+
+  echo "qbit-hermes-agent-install: completed (system Hermes)"
+  exit 0
+fi
+
+# ── No system Hermes found — install into managed tree ───────────────────
+echo "qbit-hermes-agent-install: no system Hermes found, installing into managed runtime tree"
+
+INSTALL_URL="${QBIT_HERMES_INSTALL_URL:-https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh}"
+
+if ! command -v curl >/dev/null 2>&1; then
+  echo "ERROR: curl is required to install Hermes" >&2
+  exit 1
+fi
+
+curl -fsSL "${INSTALL_URL}" | bash -s -- --skip-setup --skip-browser
+
+echo "qbit-hermes-agent-install: Hermes install hook completed"
+HOOKEOF
+  run chmod 0755 "${tmp_hook}"
+  run ${SUDO} install -m 0755 "${tmp_hook}" "${hook}"
+  ok "Provisioner hook installed -> ${hook}"
+}
+
 # ── Install setup UI bundle + launcher ────────────────────────────────────────
 install_setup_ui() {
   [[ -n "${SETUP_UI_DIR}" ]] || SETUP_UI_DIR="${SHARE_DIR}/setup-ui"
@@ -468,12 +546,112 @@ main() {
   done
   echo
 
+  install_provisioner_hook
+  install_systemd_units
   install_setup_ui
   install_launcher
-  install_provisioner_hook
   echo
 
   print_post_install
+}
+
+# ── Install systemd service units for the daemon (and local-api) ──────────────
+# On the normal Pi appliance, deploy_device.sh installs these units. On BYOH,
+# we install adapted versions that point at the user-local data root instead of
+# /var/lib/qbit-hermes. Both services run as root (matching the appliance path)
+# because the daemon needs root for systemctl operations, service management,
+# and file access within the managed runtime tree.
+install_systemd_units() {
+  local data_root="${XDG_DATA_HOME:-${HOME}/.local/share}/qbit-hermes"
+  local setup_root="${data_root}/setup/setup"
+  local runtime_root="${setup_root}/runtime/hermes"
+
+  # --- daemon service ---
+  local tmp_daemon_unit="${WORK_DIR:-$(mktemp -d)}/qbit-hermes-daemon.service"
+  cat > "${tmp_daemon_unit}" <<EOF
+[Unit]
+Description=qbit.me Hermes runtime health daemon (BYOH)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=${INSTALL_DIR}/qbit-me-daemon --interval-seconds 30 --state-path ${data_root}/setup/bootstrap-state.json --history-path ${data_root}/runtime/health-history.json --setup-root ${setup_root} --cloud-api-base-url https://dev-app.qbit.me --cloud-prototype-access-key qbit-local-prototype-access-key --cloud-state-path ${data_root}/runtime/cloud-bridge-state.json --cloud-outbox-path ${data_root}/runtime/cloud-outbox.json
+WorkingDirectory=${HOME}
+Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+Environment="HOME=${runtime_root}"
+Environment="HERMES_HOME=${runtime_root}/data"
+Environment="HERMES_INSTALL_DIR=${runtime_root}/hermes-agent"
+Environment="QBIT_HERMES_CLI_BIN_PATH=${HOME}/.local/bin/hermes"
+Restart=always
+RestartSec=5
+User=root
+Group=root
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=false
+ProtectControlGroups=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictRealtime=true
+SystemCallArchitectures=native
+ReadWritePaths=${data_root}
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  run ${SUDO} install -m 0644 "${tmp_daemon_unit}" /etc/systemd/system/qbit-hermes-daemon.service
+  run ${SUDO} systemctl daemon-reload
+  run ${SUDO} systemctl enable qbit-hermes-daemon.service
+  run ${SUDO} systemctl start qbit-hermes-daemon.service
+  ok "Daemon systemd unit installed + enabled + started"
+
+  # --- local-api service (for setup, runs on-demand after BLE bootstrap) ---
+  local tmp_api_unit="${WORK_DIR:-$(mktemp -d)}/qbit-hermes-local-api.service"
+  cat > "${tmp_api_unit}" <<EOF
+[Unit]
+Description=qbit.me Hermes Local Setup API (BYOH)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=${INSTALL_DIR}/qbit-me-local-api --bind 127.0.0.1:8081 --setup-ui-dir ${SHARE_DIR}/setup-ui --state-path ${data_root}/setup/bootstrap-state.json --draft-path ${data_root}/setup/staged-config.json --secret-path ${data_root}/setup/staged-secrets.json --progress-path ${data_root}/setup/install-progress.json
+WorkingDirectory=${HOME}
+Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+Environment="QBIT_HERMES_CLI_BIN_PATH=${HOME}/.local/bin/hermes"
+Environment="QBIT_HERMES_INSTALL_HOOK_PATH=${INSTALL_DIR}/qbit-hermes-agent-install"
+Restart=on-failure
+RestartSec=5
+User=root
+Group=root
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=false
+ProtectControlGroups=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictRealtime=true
+SystemCallArchitectures=native
+ReadWritePaths=${data_root} ${HOME}/.local/bin ${HOME}/.local/share /etc/systemd/system
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  run ${SUDO} install -m 0644 "${tmp_api_unit}" /etc/systemd/system/qbit-hermes-local-api.service
+  run ${SUDO} systemctl daemon-reload
+  # Don't enable local-api by default — it's started on-demand during setup
+  ok "Local API systemd unit installed (not enabled; starts on-demand)"
 }
 
 # ── Install the default Phase 3 Hermes install hook ───────────────────────────
@@ -528,14 +706,23 @@ Next steps:
   3. Complete the guided setup (device name, timezone, providers, gateways)
      and watch install progress in the browser.
 
+  4. After setup completes, the qbit-hermes-daemon service starts
+     automatically (it was enabled during installation). The managed
+     gateway service is installed by the provisioner during setup.
+
 Installed binaries (in ${INSTALL_DIR}):
-  - qbit-me-local-api (embeds the qbit-me-provisioner install/runtime engine), qbit-me-daemon$([[ ${with_ble} -eq 1 ]] && printf ', qbit-me-ble')
+  - qbit-me-local-api (embeds the qbit-me-provisioner install/runtime engine)
+  - qbit-me-daemon
+  - qbit-me-ble (--with-ble only)
+
+Installed systemd services:
+  - qbit-hermes-daemon.service (enabled, starts on boot)
+  - qbit-hermes-local-api.service (not enabled; starts on-demand for setup)
+  - qbit-hermes-gateway.service (installed by provisioner during setup)
 
 Notes:
   - The mobile app + BLE onboarding path is unaffected by this installer.
   - No host network / Wi-Fi configuration was changed.
-  - No desktop icon or boot service was installed; start setup with the
-    'qbit-hermes-setup' command above whenever you need it.
 EOF
 }
 
