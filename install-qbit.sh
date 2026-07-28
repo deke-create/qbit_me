@@ -68,6 +68,30 @@ run() {
   "$@"
 }
 
+# ── Snap-curl detection ───────────────────────────────────────────────────────
+# On some Ubuntu variants (notably Ubuntu MATE), `curl` is shipped as a snap.
+# Snap-curl runs in its own mount namespace and CANNOT open files written by
+# the host shell into /tmp (or other host-only paths), so `curl -o /tmp/x`
+# fails with "Failed to open the file ...: No such file or directory" even
+# though the path exists from the shell's perspective.
+#
+# When snap-curl is detected, we prefer wget for file downloads (and for the
+# piped Hermes installer) and only fall back to curl when wget is unavailable.
+# Pipe-to-bash with snap-curl works fine (stdout is not a sandboxed file), but
+# file writes do not, so this is the safer default.
+is_snap_curl() {
+  command -v curl >/dev/null 2>&1 || return 1
+  local resolved
+  resolved="$(readlink -f "$(command -v curl)" 2>/dev/null || true)"
+  [[ "${resolved}" == /snap/* ]]
+}
+
+PREFER_WGET=0
+if is_snap_curl; then
+  PREFER_WGET=1
+  warn "snap-curl detected; preferring wget for file downloads (snap-curl cannot write to host /tmp)."
+fi
+
 usage() {
   cat <<EOF
 Usage: ${PROGRAM_NAME} [options]
@@ -130,8 +154,7 @@ detect_platform() {
   case "${uname_m}" in
     x86_64|amd64)        ARCH_NAME="x86_64" ;;
     arm64|aarch64)       ARCH_NAME="aarch64" ;;
-    armv7l|armv7|armhf)  ARCH_NAME="armv7" ;;
-    *) die "Unsupported CPU architecture: ${uname_m} (supported: x86_64, aarch64, armv7)" ;;
+    *) die "Unsupported CPU architecture: ${uname_m} (supported: x86_64, aarch64)" ;;
   esac
 
   IS_RASPBERRY_PI=0
@@ -177,13 +200,15 @@ detect_hermes() {
 install_hermes() {
   log "Installing Hermes via official installer…"
   log "  ${QBIT_HERMES_INSTALL_URL}"
-  if ! command -v curl >/dev/null 2>&1; then
-    die "curl is required to install Hermes. Install curl and re-run, or install Hermes first."
+  if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+    die "curl or wget is required to install Hermes. Install one and re-run, or install Hermes first."
   fi
   # --skip-setup --skip-browser keeps the BYOH flow non-interactive; the qbit.me
   # browser setup completes provider/gateway configuration afterwards.
   if [[ "${dry_run}" -eq 1 ]]; then
-    printf '   [dry-run] curl -fsSL %s | bash -s -- --skip-setup --skip-browser\n' "${QBIT_HERMES_INSTALL_URL}"
+    printf '   [dry-run] installer pipe -> bash -s -- --skip-setup --skip-browser\n'
+  elif [[ "${PREFER_WGET}" -eq 1 ]] && command -v wget >/dev/null 2>&1; then
+    wget -qO - "${QBIT_HERMES_INSTALL_URL}" | bash -s -- --skip-setup --skip-browser
   else
     curl -fsSL "${QBIT_HERMES_INSTALL_URL}" | bash -s -- --skip-setup --skip-browser
   fi
@@ -245,7 +270,12 @@ install_binary_file() {
 download_to() {
   # download_to <url> <dest>
   local url="$1" dest="$2"
-  if command -v curl >/dev/null 2>&1; then
+  # When snap-curl is present, prefer wget first — snap-curl cannot write to
+  # host /tmp paths (it lives in its own mount namespace). Only fall back to
+  # curl when wget is unavailable.
+  if [[ "${PREFER_WGET}" -eq 1 ]] && command -v wget >/dev/null 2>&1; then
+    run wget -qO "${dest}" "${url}"
+  elif command -v curl >/dev/null 2>&1; then
     run curl -fSL --proto '=https' --tlsv1.2 -o "${dest}" "${url}"
   elif command -v wget >/dev/null 2>&1; then
     run wget -qO "${dest}" "${url}"
@@ -563,7 +593,13 @@ main() {
 # and file access within the managed runtime tree.
 install_systemd_units() {
   local data_root="${XDG_DATA_HOME:-${HOME}/.local/share}/qbit-hermes"
-  local setup_root="${data_root}/setup/setup"
+  local setup_root="${data_root}/setup"
+  local legacy_setup_root="${data_root}/setup/setup"
+  if [[ -d "${legacy_setup_root}/runtime/hermes" ]] && [[ ! -d "${setup_root}/runtime/hermes" ]]; then
+    # Backward compatibility for earlier BYOH installs that wrote setup state
+    # under a duplicated setup/setup path.
+    setup_root="${legacy_setup_root}"
+  fi
   local runtime_root="${setup_root}/runtime/hermes"
 
   # --- daemon service ---
@@ -650,65 +686,24 @@ WantedBy=multi-user.target
 EOF
   run ${SUDO} install -m 0644 "${tmp_api_unit}" /etc/systemd/system/qbit-hermes-local-api.service
   run ${SUDO} systemctl daemon-reload
-  # Don't enable local-api by default — it's started on-demand during setup
-  ok "Local API systemd unit installed (not enabled; starts on-demand)"
-}
-
-# ── Install the default Phase 3 Hermes install hook ───────────────────────────
-# The qbit-me-provisioner needs a Hermes install command to invoke during the
-# "Install Hermes core" step. On the normal Pi appliance path this is pre-wired
-# via systemd env files. On the BYOH path we install a small hook script that
-# runs the official Hermes installer with --skip-setup --skip-browser so it
-# installs into the provisioner's managed runtime tree (the provisioner sets
-# HOME, HERMES_HOME, and HERMES_INSTALL_DIR env vars before invoking the hook).
-install_provisioner_hook() {
-  local hook_path="${INSTALL_DIR}/qbit-hermes-agent-install"
-  local tmp_hook="${WORK_DIR:-$(mktemp -d)}/qbit-hermes-agent-install"
-  cat > "${tmp_hook}" <<'HOOK_EOF'
-#!/usr/bin/env bash
-# qbit-hermes-agent-install — default Phase 3 Hermes install hook for BYOH
-#
-# The qbit-me-provisioner sets HOME, HERMES_HOME, HERMES_INSTALL_DIR, and
-# QBIT_HERMES_* env vars pointing at the managed runtime tree before invoking
-# this hook. We run the official Hermes installer with --skip-setup --skip-browser
-# so it installs into the managed tree without launching interactive setup.
-set -euo pipefail
-
-INSTALL_URL="${QBIT_HERMES_INSTALL_URL:-https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh}"
-
-if ! command -v curl >/dev/null 2>&1; then
-  echo "ERROR: curl is required to install Hermes into the managed runtime tree" >&2
-  exit 1
-fi
-
-curl -fsSL "${INSTALL_URL}" | bash -s -- --skip-setup --skip-browser
-HOOK_EOF
-  run chmod 0755 "${tmp_hook}"
-  run ${SUDO} install -m 0755 "${tmp_hook}" "${hook_path}"
-  ok "Provisioner install hook -> ${hook_path}"
+  # Enable + start the local-api so the browser setup is immediately reachable
+  # at http://127.0.0.1:8081/ with no terminal interaction. The BYOH path has no
+  # BLE trigger to start it on-demand (unlike the Pi appliance path), so it must
+  # be running from the moment the installer finishes.
+  run ${SUDO} systemctl enable qbit-hermes-local-api.service
+  run ${SUDO} systemctl start qbit-hermes-local-api.service
+  ok "Local API systemd unit installed + enabled + started (http://${SETUP_BIND_ADDRESS}/)"
 }
 
 print_post_install() {
   cat <<EOF
 ✓ qbit.me BYOH installation complete.
 
-Next steps:
-  1. Start the local setup server (it does not auto-start):
+The local setup server is running now. Open this URL in your browser
+to complete the guided setup (device name, timezone, providers, gateways)
+and watch install progress:
 
-       qbit-hermes-setup
-
-     (full path: ${INSTALL_DIR}/qbit-hermes-setup)
-
-  2. Open the browser setup UI:
-
-       http://${SETUP_BIND_ADDRESS}/
-
-  3. Complete the guided setup (device name, timezone, providers, gateways)
-     and watch install progress in the browser.
-
-  4. After setup completes, the qbit-hermes-daemon service starts
-     automatically (it was enabled during installation). The managed
-     gateway service is installed by the provisioner during setup.
+    http://${SETUP_BIND_ADDRESS}/
 
 Installed binaries (in ${INSTALL_DIR}):
   - qbit-me-local-api (embeds the qbit-me-provisioner install/runtime engine)
@@ -716,8 +711,8 @@ Installed binaries (in ${INSTALL_DIR}):
   - qbit-me-ble (--with-ble only)
 
 Installed systemd services:
+  - qbit-hermes-local-api.service (enabled + started; serving the setup UI now)
   - qbit-hermes-daemon.service (enabled, starts on boot)
-  - qbit-hermes-local-api.service (not enabled; starts on-demand for setup)
   - qbit-hermes-gateway.service (installed by provisioner during setup)
 
 Notes:
