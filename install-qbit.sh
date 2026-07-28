@@ -641,6 +641,8 @@ StandardError=journal
 [Install]
 WantedBy=multi-user.target
 EOF
+  # Ensure the data root exists before systemd constructs the mount namespace.
+  run ${SUDO} mkdir -p "${data_root}"
   run ${SUDO} install -m 0644 "${tmp_daemon_unit}" /etc/systemd/system/qbit-hermes-daemon.service
   run ${SUDO} systemctl daemon-reload
   run ${SUDO} systemctl enable qbit-hermes-daemon.service
@@ -677,6 +679,13 @@ RestrictSUIDSGID=true
 LockPersonality=true
 RestrictRealtime=true
 SystemCallArchitectures=native
+# The local-api needs write access to: the BYOH data root (state, drafts,
+# secrets, progress), ${HOME}/.local/bin + ${HOME}/.local/share (where the
+# embedded provisioner writes the Hermes CLI wrapper and runtime tree), and
+# /etc/systemd/system (where the provisioner installs the gateway unit).
+# All entries MUST exist before systemd constructs the mount namespace,
+# otherwise the service fails with status=226/NAMESPACE. The installer
+# mkdir -p's each of these paths before starting the service.
 ReadWritePaths=${data_root} ${HOME}/.local/bin ${HOME}/.local/share /etc/systemd/system
 StandardOutput=journal
 StandardError=journal
@@ -684,6 +693,11 @@ StandardError=journal
 [Install]
 WantedBy=multi-user.target
 EOF
+  # Ensure every ReadWritePaths entry exists before systemd constructs the
+  # mount namespace — systemd refuses to start (status=226/NAMESPACE) if any
+  # listed path is missing. ~/.local/bin in particular does not exist on a
+  # fresh Ubuntu install.
+  run ${SUDO} mkdir -p "${data_root}" "${HOME}/.local/bin" "${HOME}/.local/share" /etc/systemd/system
   run ${SUDO} install -m 0644 "${tmp_api_unit}" /etc/systemd/system/qbit-hermes-local-api.service
   run ${SUDO} systemctl daemon-reload
   # Enable + start the local-api so the browser setup is immediately reachable
