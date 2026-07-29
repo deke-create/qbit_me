@@ -451,16 +451,47 @@ fi
 if [[ -n "$SYSTEM_HERMES" ]]; then
   echo "qbit-hermes-agent-install: Hermes found at ${SYSTEM_HERMES}"
 
-  # Create symlinks in the managed runtime tree so the provisioner can find
-  # the binary at the paths it expects (runtime_local_bin_dir and
-  # runtime_install_dir/venv/bin).
+  # Resolve symlinks to the actual binary. If $SYSTEM_HERMES is itself a
+  # symlink (e.g. ~/.local/bin/hermes -> ~/.hermes/hermes-agent/venv/bin/hermes),
+  # we must point the managed runtime at the REAL target, not the symlink.
+  # Otherwise the provisioner's wrapper script at $RUNTIME_ROOT/.local/bin/hermes
+  # would create an exec loop (wrapper execs itself through the symlink chain
+  # → "Argument list too long").
+  RESOLVED_HERMES="$SYSTEM_HERMES"
+  if [[ -L "$SYSTEM_HERMES" ]]; then
+    RESOLVED_HERMES="$(readlink -f "$SYSTEM_HERMES" 2>/dev/null || readlink "$SYSTEM_HERMES")"
+    echo "qbit-hermes-agent-install: resolved symlink ${SYSTEM_HERMES} -> ${RESOLVED_HERMES}"
+  fi
+  if [[ ! -x "$RESOLVED_HERMES" ]]; then
+    echo "ERROR: resolved Hermes binary not executable: ${RESOLVED_HERMES}" >&2
+    exit 1
+  fi
+
   RUNTIME_ROOT="${QBIT_HERMES_RUNTIME_ROOT}"
   if [[ -n "$RUNTIME_ROOT" ]]; then
     mkdir -p "$RUNTIME_ROOT/.local/bin"
     mkdir -p "$RUNTIME_ROOT/hermes-agent/venv/bin"
-    ln -sf "$SYSTEM_HERMES" "$RUNTIME_ROOT/.local/bin/hermes"
-    ln -sf "$SYSTEM_HERMES" "$RUNTIME_ROOT/hermes-agent/venv/bin/hermes"
-    echo "Symlinks created in $RUNTIME_ROOT"
+
+    # Create a wrapper script (not a symlink) at the managed runtime path.
+    # The wrapper sets the env vars the provisioner expects and execs the
+    # RESOLVED Hermes binary. Using a wrapper instead of a symlink avoids
+    # the exec-loop where the provisioner's own wrapper would exec itself.
+    cat > "$RUNTIME_ROOT/.local/bin/hermes" <<WRAPPER_EOF
+#!/usr/bin/env bash
+set -euo pipefail
+export HOME="\${HOME:-${RUNTIME_ROOT}}"
+export HERMES_HOME="\${HERMES_HOME:-${RUNTIME_ROOT}/data}"
+export HERMES_INSTALL_DIR="\${HERMES_INSTALL_DIR:-${RUNTIME_ROOT}/hermes-agent}"
+export PATH="$RUNTIME_ROOT/.local/bin:\${PATH}"
+exec '${RESOLVED_HERMES}' "\$@"
+WRAPPER_EOF
+    chmod +x "$RUNTIME_ROOT/.local/bin/hermes"
+
+    # The venv/bin path can be a direct symlink since the provisioner doesn't
+    # write a wrapper there.
+    ln -sfn "$RESOLVED_HERMES" "$RUNTIME_ROOT/hermes-agent/venv/bin/hermes"
+
+    echo "Wrapper + symlink created in $RUNTIME_ROOT (exec -> ${RESOLVED_HERMES})"
   fi
 
   echo "qbit-hermes-agent-install: completed (system Hermes)"
