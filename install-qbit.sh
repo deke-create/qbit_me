@@ -474,15 +474,15 @@ if [[ -n "$SYSTEM_HERMES" ]]; then
 
     # Create a wrapper script (not a symlink) at the managed runtime path.
     # The wrapper sets the env vars the provisioner expects and execs the
-    # RESOLVED Hermes binary. Using a wrapper instead of a symlink avoids
-    # the exec-loop where the provisioner's own wrapper would exec itself.
+    # RESOLVED Hermes binary directly. We do NOT prepend $RUNTIME_ROOT/.local/bin
+    # to PATH — doing so causes the venv's `hermes` script to resolve `hermes`
+    # back to this wrapper (exec loop → "Argument list too long").
     cat > "$RUNTIME_ROOT/.local/bin/hermes" <<WRAPPER_EOF
 #!/usr/bin/env bash
 set -euo pipefail
 export HOME="\${HOME:-${RUNTIME_ROOT}}"
 export HERMES_HOME="\${HERMES_HOME:-${RUNTIME_ROOT}/data}"
 export HERMES_INSTALL_DIR="\${HERMES_INSTALL_DIR:-${RUNTIME_ROOT}/hermes-agent}"
-export PATH="$RUNTIME_ROOT/.local/bin:\${PATH}"
 exec '${RESOLVED_HERMES}' "\$@"
 WRAPPER_EOF
     chmod +x "$RUNTIME_ROOT/.local/bin/hermes"
