@@ -428,55 +428,78 @@ echo "  HERMES_INSTALL_DIR=${HERMES_INSTALL_DIR:-<unset>}"
 echo "  HOME=${HOME:-<unset>}"
 
 # ── Resolve the system Hermes binary ──────────────────────────────────────
-# Check system locations AND user-installed locations. The BYOH installer
-# installs Hermes into ~/.hermes/bin/hermes (via the official installer with
-# --skip-setup --skip-browser), so we must check there too.
+# Prefer the real venv entrypoint first. Never treat a qbit managed wrapper
+# (under qbit-hermes paths, or a shell script that re-execs another hermes
+# path) as the system binary — that creates an exec loop with the managed
+# runtime wrapper and the old BYOH QBIT_HERMES_CLI_BIN_PATH=~/.local/bin/hermes
+# overwrite ("Argument list too long").
 SYSTEM_HERMES=""
 ORIG_HOME="${QBIT_HERMES_ORIG_HOME:-${HOME}}"
+RUNTIME_ROOT="${QBIT_HERMES_RUNTIME_ROOT:-}"
+
+is_usable_hermes_binary() {
+  local candidate="$1"
+  [[ -n "$candidate" && -x "$candidate" ]] || return 1
+  # Never select binaries inside the managed runtime tree as the "system" source.
+  if [[ -n "$RUNTIME_ROOT" && "$candidate" == "$RUNTIME_ROOT"* ]]; then
+    return 1
+  fi
+  case "$candidate" in
+    *qbit-hermes*) return 1 ;;
+  esac
+  # Skip qbit managed shell wrappers (they set HERMES_HOME / mention qbit-hermes).
+  if head -1 "$candidate" 2>/dev/null | grep -qE '^#!.*(bash|sh)'; then
+    if grep -qE 'qbit-hermes|HERMES_MANAGED=1|export HERMES_HOME=' "$candidate" 2>/dev/null; then
+      return 1
+    fi
+  fi
+  return 0
+}
+
 for candidate in \
+    "${ORIG_HOME}/.hermes/hermes-agent/venv/bin/hermes" \
+    "${ORIG_HOME}/.hermes/bin/hermes" \
     /usr/local/bin/hermes \
     /usr/bin/hermes \
     /opt/hermes/bin/hermes \
-    "${ORIG_HOME}/.hermes/bin/hermes" \
     "${ORIG_HOME}/.local/bin/hermes"; do
-  if [[ -x "$candidate" ]]; then
+  if is_usable_hermes_binary "$candidate"; then
     SYSTEM_HERMES="$candidate"
     break
   fi
 done
 if [[ -z "$SYSTEM_HERMES" ]] && command -v hermes >/dev/null 2>&1; then
-  SYSTEM_HERMES="$(command -v hermes)"
+  candidate="$(command -v hermes)"
+  if is_usable_hermes_binary "$candidate"; then
+    SYSTEM_HERMES="$candidate"
+  fi
 fi
 
 if [[ -n "$SYSTEM_HERMES" ]]; then
   echo "qbit-hermes-agent-install: Hermes found at ${SYSTEM_HERMES}"
 
-  # Resolve symlinks to the actual binary. If $SYSTEM_HERMES is itself a
-  # symlink (e.g. ~/.local/bin/hermes -> ~/.hermes/hermes-agent/venv/bin/hermes),
-  # we must point the managed runtime at the REAL target, not the symlink.
-  # Otherwise the provisioner's wrapper script at $RUNTIME_ROOT/.local/bin/hermes
-  # would create an exec loop (wrapper execs itself through the symlink chain
-  # → "Argument list too long").
-  RESOLVED_HERMES="$SYSTEM_HERMES"
-  if [[ -L "$SYSTEM_HERMES" ]]; then
-    RESOLVED_HERMES="$(readlink -f "$SYSTEM_HERMES" 2>/dev/null || readlink "$SYSTEM_HERMES")"
-    echo "qbit-hermes-agent-install: resolved symlink ${SYSTEM_HERMES} -> ${RESOLVED_HERMES}"
+  # Always resolve to the final target when possible.
+  RESOLVED_HERMES="$(readlink -f "$SYSTEM_HERMES" 2>/dev/null || true)"
+  if [[ -z "$RESOLVED_HERMES" || ! -x "$RESOLVED_HERMES" ]]; then
+    RESOLVED_HERMES="$SYSTEM_HERMES"
   fi
   if [[ ! -x "$RESOLVED_HERMES" ]]; then
     echo "ERROR: resolved Hermes binary not executable: ${RESOLVED_HERMES}" >&2
     exit 1
   fi
+  # Final guard: never point the managed wrapper at itself / managed tree.
+  if [[ -n "$RUNTIME_ROOT" && "$RESOLVED_HERMES" == "$RUNTIME_ROOT"* ]]; then
+    echo "ERROR: resolved Hermes binary is inside the managed runtime tree: ${RESOLVED_HERMES}" >&2
+    exit 1
+  fi
+  echo "qbit-hermes-agent-install: using resolved binary ${RESOLVED_HERMES}"
 
-  RUNTIME_ROOT="${QBIT_HERMES_RUNTIME_ROOT}"
   if [[ -n "$RUNTIME_ROOT" ]]; then
     mkdir -p "$RUNTIME_ROOT/.local/bin"
     mkdir -p "$RUNTIME_ROOT/hermes-agent/venv/bin"
 
-    # Create a wrapper script (not a symlink) at the managed runtime path.
-    # The wrapper sets the env vars the provisioner expects and execs the
-    # RESOLVED Hermes binary directly. We do NOT prepend $RUNTIME_ROOT/.local/bin
-    # to PATH — doing so causes the venv's `hermes` script to resolve `hermes`
-    # back to this wrapper (exec loop → "Argument list too long").
+    # Managed wrapper only lives under the runtime tree. It must exec the real
+    # upstream binary and must NOT prepend $RUNTIME_ROOT/.local/bin to PATH.
     cat > "$RUNTIME_ROOT/.local/bin/hermes" <<WRAPPER_EOF
 #!/usr/bin/env bash
 set -euo pipefail
@@ -487,8 +510,7 @@ exec '${RESOLVED_HERMES}' "\$@"
 WRAPPER_EOF
     chmod +x "$RUNTIME_ROOT/.local/bin/hermes"
 
-    # The venv/bin path can be a direct symlink since the provisioner doesn't
-    # write a wrapper there.
+    # Prefer a direct venv-path symlink for anything that looks there first.
     ln -sfn "$RESOLVED_HERMES" "$RUNTIME_ROOT/hermes-agent/venv/bin/hermes"
 
     echo "Wrapper + symlink created in $RUNTIME_ROOT (exec -> ${RESOLVED_HERMES})"
@@ -561,10 +583,11 @@ mkdir -p "\${DATA_DIR}/setup"
 export QBIT_HERMES_SETUP_UI_DIR="\${SETUP_UI_DIR}"
 export QBIT_HERMES_LOCAL_API_BIND="\${BIND_ADDRESS}"
 
-# Point the Phase 3 provisioner at user-writable paths so the BYOH path (which
-# runs as the operator user, not root) can write the managed hermes CLI wrapper
-# and find the install hook without requiring root privileges.
-export QBIT_HERMES_CLI_BIN_PATH="\${HOME}/.local/bin/hermes"
+# Point the Phase 3 provisioner at user-writable managed paths. The managed
+# Hermes CLI wrapper must live under the runtime tree only — never overwrite
+# the operator's ~/.local/bin/hermes entrypoint (that caused the BYOH
+# wrapper exec loop and broke the user Hermes CLI).
+export QBIT_HERMES_CLI_BIN_PATH="\${DATA_DIR}/runtime/hermes/.local/bin/hermes"
 export QBIT_HERMES_INSTALL_HOOK_PATH="${INSTALL_DIR}/qbit-hermes-agent-install"
 export QBIT_HERMES_ORIG_HOME="${HOME}"
 
@@ -671,6 +694,9 @@ install_systemd_units() {
     setup_root="${legacy_setup_root}"
   fi
   local runtime_root="${setup_root}/runtime/hermes"
+  # Managed CLI wrapper lives only under the runtime tree — never the operator
+  # ~/.local/bin/hermes entrypoint (that overwrite created the BYOH exec loop).
+  local managed_cli_bin="${runtime_root}/.local/bin/hermes"
 
   # --- daemon service ---
   local tmp_daemon_unit="${WORK_DIR:-$(mktemp -d)}/qbit-hermes-daemon.service"
@@ -688,7 +714,7 @@ Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 Environment="HOME=${runtime_root}"
 Environment="HERMES_HOME=${runtime_root}/data"
 Environment="HERMES_INSTALL_DIR=${runtime_root}/hermes-agent"
-Environment="QBIT_HERMES_CLI_BIN_PATH=${HOME}/.local/bin/hermes"
+Environment="QBIT_HERMES_CLI_BIN_PATH=${managed_cli_bin}"
 Restart=always
 RestartSec=5
 User=root
@@ -727,7 +753,7 @@ EOF
   run ${SUDO} systemctl start qbit-hermes-daemon.service
   ok "Daemon systemd unit installed + enabled + started"
 
-  # --- local-api service (for setup, runs on-demand after BLE bootstrap) ---
+  # --- local-api service ---
   local tmp_api_unit="${WORK_DIR:-$(mktemp -d)}/qbit-hermes-local-api.service"
   cat > "${tmp_api_unit}" <<EOF
 [Unit]
@@ -740,7 +766,7 @@ Type=simple
 ExecStart=${INSTALL_DIR}/qbit-me-local-api --bind 127.0.0.1:8081 --setup-ui-dir ${SHARE_DIR}/setup-ui --state-path ${data_root}/setup/bootstrap-state.json --draft-path ${data_root}/setup/staged-config.json --secret-path ${data_root}/setup/staged-secrets.json --progress-path ${data_root}/setup/install-progress.json
 WorkingDirectory=${HOME}
 Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-Environment="QBIT_HERMES_CLI_BIN_PATH=${HOME}/.local/bin/hermes"
+Environment="QBIT_HERMES_CLI_BIN_PATH=${managed_cli_bin}"
 Environment="QBIT_HERMES_INSTALL_HOOK_PATH=${INSTALL_DIR}/qbit-hermes-agent-install"
 Environment="QBIT_HERMES_ORIG_HOME=${HOME}"
 Restart=on-failure
@@ -759,13 +785,11 @@ LockPersonality=true
 RestrictRealtime=true
 SystemCallArchitectures=native
 # The local-api needs write access to: the BYOH data root (state, drafts,
-# secrets, progress), ${HOME}/.local/bin + ${HOME}/.local/share (where the
-# embedded provisioner writes the Hermes CLI wrapper and runtime tree), and
-# /etc/systemd/system (where the provisioner installs the gateway unit).
-# All entries MUST exist before systemd constructs the mount namespace,
-# otherwise the service fails with status=226/NAMESPACE. The installer
-# mkdir -p's each of these paths before starting the service.
-ReadWritePaths=${data_root} ${HOME}/.local/bin ${HOME}/.local/share /etc/systemd/system
+# secrets, progress, managed runtime tree) and /etc/systemd/system (where the
+# provisioner installs the gateway unit). All entries MUST exist before
+# systemd constructs the mount namespace, otherwise the service fails with
+# status=226/NAMESPACE.
+ReadWritePaths=${data_root} ${HOME}/.local/share /etc/systemd/system
 StandardOutput=journal
 StandardError=journal
 
@@ -774,9 +798,11 @@ WantedBy=multi-user.target
 EOF
   # Ensure every ReadWritePaths entry exists before systemd constructs the
   # mount namespace — systemd refuses to start (status=226/NAMESPACE) if any
-  # listed path is missing. ~/.local/bin in particular does not exist on a
-  # fresh Ubuntu install.
-  run ${SUDO} mkdir -p "${data_root}" "${HOME}/.local/bin" "${HOME}/.local/share" /etc/systemd/system
+  # listed path is missing.
+  run ${SUDO} mkdir -p "${data_root}" "${HOME}/.local/share" /etc/systemd/system
+  # Repair a previously clobbered user hermes CLI if it is a qbit managed
+  # wrapper. The user CLI must point at the real Hermes venv binary.
+  repair_user_hermes_cli
   run ${SUDO} install -m 0644 "${tmp_api_unit}" /etc/systemd/system/qbit-hermes-local-api.service
   run ${SUDO} systemctl daemon-reload
   # Enable + start the local-api so the browser setup is immediately reachable
@@ -786,6 +812,42 @@ EOF
   run ${SUDO} systemctl enable qbit-hermes-local-api.service
   run ${SUDO} systemctl start qbit-hermes-local-api.service
   ok "Local API systemd unit installed + enabled + started (http://${SETUP_BIND_ADDRESS}/)"
+}
+
+# If a previous BYOH install overwrote ~/.local/bin/hermes with a managed
+# wrapper, restore a symlink to the real Hermes venv entrypoint.
+repair_user_hermes_cli() {
+  local user_hermes="${HOME}/.local/bin/hermes"
+  local venv_hermes="${HOME}/.hermes/hermes-agent/venv/bin/hermes"
+  [[ -x "${venv_hermes}" ]] || return 0
+  mkdir -p "${HOME}/.local/bin"
+
+  if [[ -L "${user_hermes}" ]]; then
+    local target
+    target="$(readlink -f "${user_hermes}" 2>/dev/null || true)"
+    if [[ "${target}" == "${venv_hermes}" ]]; then
+      return 0
+    fi
+  fi
+
+  if [[ -f "${user_hermes}" ]] && head -1 "${user_hermes}" 2>/dev/null | grep -qE '^#!.*(bash|sh)'; then
+    if grep -qE 'qbit-hermes|HERMES_MANAGED=1|export HERMES_HOME=' "${user_hermes}" 2>/dev/null; then
+      log "Repairing user Hermes CLI at ${user_hermes} (was a managed qbit wrapper)"
+      if [[ -n "${SUDO}" ]]; then
+        run ${SUDO} rm -f "${user_hermes}"
+      else
+        run rm -f "${user_hermes}"
+      fi
+      run ln -sfn "${venv_hermes}" "${user_hermes}"
+      ok "User Hermes CLI restored -> ${venv_hermes}"
+      return 0
+    fi
+  fi
+
+  if [[ ! -e "${user_hermes}" ]]; then
+    run ln -sfn "${venv_hermes}" "${user_hermes}"
+    ok "User Hermes CLI linked -> ${venv_hermes}"
+  fi
 }
 
 print_post_install() {
