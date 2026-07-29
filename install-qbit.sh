@@ -224,13 +224,14 @@ install_hermes() {
       chown_sudo="sudo"
     fi
   fi
-  if [[ -d "${HOME}/.cache/uv" ]]; then
-    run ${chown_sudo} chown -R "$(id -u):$(id -g)" "${HOME}/.cache/uv" 2>/dev/null || true
-  fi
-  # Also fix ~/.hermes ownership (provisioner may have written root-owned files)
-  if [[ -d "${HOME}/.hermes" ]]; then
-    run ${chown_sudo} chown -R "$(id -u):$(id -g)" "${HOME}/.hermes" 2>/dev/null || true
-  fi
+  # Fix ownership of all paths the Hermes installer writes to. A prior failed
+  # provisioner run (as root) may have left root-owned files/dirs that block
+  # the user from writing symlinks or cache files.
+  for path in "${HOME}/.cache/uv" "${HOME}/.hermes" "${HOME}/.local/bin"; do
+    if [[ -d "${path}" ]]; then
+      run ${chown_sudo} chown -R "$(id -u):$(id -g)" "${path}" 2>/dev/null || true
+    fi
+  done
   # --skip-setup --skip-browser keeps the BYOH flow non-interactive; the qbit.me
   # browser setup completes provider/gateway configuration afterwards.
   if [[ "${dry_run}" -eq 1 ]]; then
