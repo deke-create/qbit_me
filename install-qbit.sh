@@ -175,23 +175,34 @@ detect_hermes() {
   HERMES_FOUND=0
   HERMES_DETAIL=""
 
-  if [[ -n "${HERMES_HOME:-}" ]] && [[ -d "${HERMES_HOME}" ]]; then
+  # A real Hermes install requires a working `hermes` binary. We check env vars
+  # first, then PATH, then common install locations — but always verify the
+  # binary actually exists and is executable, not just that a directory exists.
+  # (An empty ~/.hermes/bin/ directory from a failed prior install must NOT
+  # count as "Hermes installed".)
+
+  if [[ -n "${HERMES_HOME:-}" ]] && [[ -x "${HERMES_HOME}/bin/hermes" ]]; then
     HERMES_FOUND=1; HERMES_DETAIL="HERMES_HOME=${HERMES_HOME}"; return
   fi
-  if [[ -n "${HERMES_INSTALL_DIR:-}" ]] && [[ -d "${HERMES_INSTALL_DIR}" ]]; then
+  if [[ -n "${HERMES_INSTALL_DIR:-}" ]] && [[ -x "${HERMES_INSTALL_DIR}/bin/hermes" ]]; then
     HERMES_FOUND=1; HERMES_DETAIL="HERMES_INSTALL_DIR=${HERMES_INSTALL_DIR}"; return
   fi
   if command -v hermes >/dev/null 2>&1; then
-    HERMES_FOUND=1; HERMES_DETAIL="hermes on PATH ($(command -v hermes))"; return
+    local hermes_bin
+    hermes_bin="$(command -v hermes)"
+    if [[ -x "${hermes_bin}" ]]; then
+      HERMES_FOUND=1; HERMES_DETAIL="hermes on PATH (${hermes_bin})"; return
+    fi
   fi
   local candidate
   for candidate in \
-      "${HOME}/.hermes" \
-      "${HOME}/.local/share/hermes" \
+      "${HOME}/.hermes/bin/hermes" \
       "${HOME}/.local/bin/hermes" \
+      "${HOME}/.local/share/hermes/bin/hermes" \
       "/usr/local/bin/hermes" \
-      "/opt/hermes"; do
-    if [[ -e "${candidate}" ]]; then
+      "/usr/bin/hermes" \
+      "/opt/hermes/bin/hermes"; do
+    if [[ -x "${candidate}" ]]; then
       HERMES_FOUND=1; HERMES_DETAIL="found at ${candidate}"; return
     fi
   done
@@ -399,8 +410,17 @@ echo "  HERMES_INSTALL_DIR=${HERMES_INSTALL_DIR:-<unset>}"
 echo "  HOME=${HOME:-<unset>}"
 
 # ── Resolve the system Hermes binary ──────────────────────────────────────
+# Check system locations AND user-installed locations. The BYOH installer
+# installs Hermes into ~/.hermes/bin/hermes (via the official installer with
+# --skip-setup --skip-browser), so we must check there too.
 SYSTEM_HERMES=""
-for candidate in /usr/local/bin/hermes /usr/bin/hermes /opt/hermes/bin/hermes; do
+ORIG_HOME="${QBIT_HERMES_ORIG_HOME:-${HOME}}"
+for candidate in \
+    /usr/local/bin/hermes \
+    /usr/bin/hermes \
+    /opt/hermes/bin/hermes \
+    "${ORIG_HOME}/.hermes/bin/hermes" \
+    "${ORIG_HOME}/.local/bin/hermes"; do
   if [[ -x "$candidate" ]]; then
     SYSTEM_HERMES="$candidate"
     break
@@ -497,6 +517,7 @@ export QBIT_HERMES_LOCAL_API_BIND="\${BIND_ADDRESS}"
 # and find the install hook without requiring root privileges.
 export QBIT_HERMES_CLI_BIN_PATH="\${HOME}/.local/bin/hermes"
 export QBIT_HERMES_INSTALL_HOOK_PATH="${INSTALL_DIR}/qbit-hermes-agent-install"
+export QBIT_HERMES_ORIG_HOME="${HOME}"
 
 echo "Starting qbit.me local setup server on http://\${BIND_ADDRESS}/"
 echo "Open that URL in your browser to complete setup. Press Ctrl+C to stop."
@@ -664,6 +685,7 @@ WorkingDirectory=${HOME}
 Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 Environment="QBIT_HERMES_CLI_BIN_PATH=${HOME}/.local/bin/hermes"
 Environment="QBIT_HERMES_INSTALL_HOOK_PATH=${INSTALL_DIR}/qbit-hermes-agent-install"
+Environment="QBIT_HERMES_ORIG_HOME=${HOME}"
 Restart=on-failure
 RestartSec=5
 User=root
