@@ -214,6 +214,23 @@ install_hermes() {
   if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
     die "curl or wget is required to install Hermes. Install one and re-run, or install Hermes first."
   fi
+  # The Hermes installer uses `uv` which caches Python builds under ~/.cache/uv.
+  # A previous failed install or provisioner run (as root) may have left
+  # root-owned files there, causing "Permission denied" when the current user
+  # tries to install Python. Fix ownership before running the installer.
+  local chown_sudo=""
+  if [[ "$(id -u)" -ne 0 ]]; then
+    if command -v sudo >/dev/null 2>&1; then
+      chown_sudo="sudo"
+    fi
+  fi
+  if [[ -d "${HOME}/.cache/uv" ]]; then
+    run ${chown_sudo} chown -R "$(id -u):$(id -g)" "${HOME}/.cache/uv" 2>/dev/null || true
+  fi
+  # Also fix ~/.hermes ownership (provisioner may have written root-owned files)
+  if [[ -d "${HOME}/.hermes" ]]; then
+    run ${chown_sudo} chown -R "$(id -u):$(id -g)" "${HOME}/.hermes" 2>/dev/null || true
+  fi
   # --skip-setup --skip-browser keeps the BYOH flow non-interactive; the qbit.me
   # browser setup completes provider/gateway configuration afterwards.
   if [[ "${dry_run}" -eq 1 ]]; then
