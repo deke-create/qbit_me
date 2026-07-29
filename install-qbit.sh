@@ -713,6 +713,14 @@ WantedBy=multi-user.target
 EOF
   # Ensure the data root exists before systemd constructs the mount namespace.
   run ${SUDO} mkdir -p "${data_root}"
+  # Write the daemon env file so the local API can read the cloud config
+  # (the setup UI uses this to derive the dashboard URL for the Done screen).
+  local tmp_daemon_env="${WORK_DIR:-$(mktemp -d)}/qbit-hermes-daemon"
+  cat > "${tmp_daemon_env}" <<EOF
+QBIT_CLOUD_API_BASE_URL=https://dev-app.qbit.me
+QBIT_CLOUD_API_PROTOTYPE_ACCESS_KEY=qbit-local-prototype-access-key
+EOF
+  run ${SUDO} install -m 0644 "${tmp_daemon_env}" /etc/default/qbit-hermes-daemon
   run ${SUDO} install -m 0644 "${tmp_daemon_unit}" /etc/systemd/system/qbit-hermes-daemon.service
   run ${SUDO} systemctl daemon-reload
   run ${SUDO} systemctl enable qbit-hermes-daemon.service
