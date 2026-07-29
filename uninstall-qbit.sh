@@ -246,7 +246,14 @@ remove_user_data() {
 
   if [[ -d "${DATA_DIR}" ]]; then
     log "Removing BYOH user data ${DATA_DIR}"
-    run rm -rf "${DATA_DIR}"
+    # The provisioner and daemon run as root and create root-owned files
+    # (state, secrets, managed runtime tree) inside the user's data dir.
+    # Use sudo to ensure root-owned files are removed cleanly.
+    if [[ -n "${SUDO}" ]]; then
+      run ${SUDO} rm -rf "${DATA_DIR}"
+    else
+      run rm -rf "${DATA_DIR}"
+    fi
     ok "BYOH user data removed."
   else
     ok "No BYOH user data found at ${DATA_DIR}."
