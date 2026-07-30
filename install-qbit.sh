@@ -530,9 +530,67 @@ if ! command -v curl >/dev/null 2>&1; then
   exit 1
 fi
 
+# The official installer runs with HOME=$RUNTIME_ROOT (set by the local API),
+# so it places the venv at $RUNTIME_ROOT/.hermes/hermes-agent/venv/bin/hermes.
+# The provisioner's resolve_runtime_hermes_binary() checks
+# $RUNTIME_ROOT/hermes-agent/venv/bin/hermes and $RUNTIME_ROOT/.local/bin/hermes
+# — neither of which exists after the official installer runs. We must create
+# the managed wrapper + venv symlink so the provisioner can find and exec the
+# real Hermes binary instead of recursing into a self-referencing wrapper
+# ("Argument list too long" / E2BIG).
 curl -fsSL "${INSTALL_URL}" | bash -s -- --skip-setup --skip-browser
 
 echo "qbit-hermes-agent-install: Hermes install hook completed"
+
+# Resolve the freshly-installed Hermes binary. The official installer places
+# it under $HOME/.hermes/hermes-agent/venv/bin/hermes (HOME=$RUNTIME_ROOT here).
+if [[ -n "$RUNTIME_ROOT" ]]; then
+  FRESH_HERMES=""
+  for fresh_candidate in \
+      "$RUNTIME_ROOT/.hermes/hermes-agent/venv/bin/hermes" \
+      "$RUNTIME_ROOT/.hermes/bin/hermes" \
+      "$HOME/.hermes/hermes-agent/venv/bin/hermes" \
+      "$HOME/.hermes/bin/hermes" \
+      /usr/local/bin/hermes; do
+    if is_usable_hermes_binary "$fresh_candidate" 2>/dev/null; then
+      FRESH_HERMES="$fresh_candidate"
+      break
+    fi
+  done
+
+  if [[ -z "$FRESH_HERMES" ]]; then
+    echo "ERROR: Hermes was installed but the venv binary could not be resolved." >&2
+    echo "Checked: $RUNTIME_ROOT/.hermes/hermes-agent/venv/bin/hermes, $HOME/.hermes/..." >&2
+    exit 1
+  fi
+
+  RESOLVED_HERMES="$(readlink -f "$FRESH_HERMES" 2>/dev/null || true)"
+  if [[ -z "$RESOLVED_HERMES" || ! -x "$RESOLVED_HERMES" ]]; then
+    RESOLVED_HERMES="$FRESH_HERMES"
+  fi
+
+  echo "qbit-hermes-agent-install: using freshly-installed binary ${RESOLVED_HERMES}"
+
+  mkdir -p "$RUNTIME_ROOT/.local/bin"
+  mkdir -p "$RUNTIME_ROOT/hermes-agent/venv/bin"
+
+  cat > "$RUNTIME_ROOT/.local/bin/hermes" <<WRAPPER_EOF
+#!/usr/bin/env bash
+set -euo pipefail
+export HOME="\${HOME:-${RUNTIME_ROOT}}"
+export HERMES_HOME="\${HERMES_HOME:-${RUNTIME_ROOT}/data}"
+export HERMES_INSTALL_DIR="\${HERMES_INSTALL_DIR:-${RUNTIME_ROOT}/hermes-agent}"
+exec '${RESOLVED_HERMES}' "\$@"
+WRAPPER_EOF
+  chmod +x "$RUNTIME_ROOT/.local/bin/hermes"
+
+  ln -sfn "$RESOLVED_HERMES" "$RUNTIME_ROOT/hermes-agent/venv/bin/hermes"
+
+  echo "Wrapper + symlink created in $RUNTIME_ROOT (exec -> ${RESOLVED_HERMES})"
+fi
+
+echo "qbit-hermes-agent-install: completed (managed install)"
+exit 0
 HOOKEOF
   run chmod 0755 "${tmp_hook}"
   run ${SUDO} install -m 0755 "${tmp_hook}" "${hook}"
