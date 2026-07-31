@@ -513,6 +513,14 @@ WRAPPER_EOF
     # Prefer a direct venv-path symlink for anything that looks there first.
     ln -sfn "$RESOLVED_HERMES" "$RUNTIME_ROOT/hermes-agent/venv/bin/hermes"
 
+    # Smoke-test: the wrapper must not E2BIG and must respond to --version.
+    if ! "$RUNTIME_ROOT/.local/bin/hermes" --version >/dev/null 2>&1; then
+      echo "ERROR: managed Hermes wrapper failed --version smoke test (exec -> ${RESOLVED_HERMES})" >&2
+      echo "Wrapper contents:" >&2
+      cat "$RUNTIME_ROOT/.local/bin/hermes" >&2 || true
+      exit 1
+    fi
+
     echo "Wrapper + symlink created in $RUNTIME_ROOT (exec -> ${RESOLVED_HERMES})"
   fi
 
@@ -544,7 +552,38 @@ echo "qbit-hermes-agent-install: Hermes install hook completed"
 
 # Resolve the freshly-installed Hermes binary. The official installer places
 # it under $HOME/.hermes/hermes-agent/venv/bin/hermes (HOME=$RUNTIME_ROOT here).
+# NOTE: is_usable_hermes_binary() deliberately rejects RUNTIME_ROOT paths when
+# looking for a *system* Hermes source. Fresh-install resolution must ALLOW
+# the managed tree — use a separate checker that only requires an executable
+# file and rejects self-exec shell wrappers.
 if [[ -n "$RUNTIME_ROOT" ]]; then
+  is_fresh_hermes_binary() {
+    local candidate="$1"
+    [[ -n "$candidate" && -x "$candidate" ]] || return 1
+    # Reject self-exec shell wrappers (E2BIG source).
+    if head -1 "$candidate" 2>/dev/null | grep -qE '^#!.*(bash|sh)'; then
+      local exec_line
+      exec_line="$(grep -E '^exec ' "$candidate" 2>/dev/null | head -1 || true)"
+      if [[ -n "$exec_line" ]]; then
+        # Extract the exec target (single-quoted path preferred).
+        local target
+        target="$(printf '%s\n' "$exec_line" | sed -n "s/^exec ['\"]\\([^'\"]*\\)['\"].*/\\1/p")"
+        if [[ -z "$target" ]]; then
+          target="$(printf '%s\n' "$exec_line" | awk '{print $2}')"
+        fi
+        if [[ -n "$target" ]]; then
+          local cand_real target_real
+          cand_real="$(readlink -f "$candidate" 2>/dev/null || echo "$candidate")"
+          target_real="$(readlink -f "$target" 2>/dev/null || echo "$target")"
+          if [[ "$cand_real" == "$target_real" || "$target" == "$candidate" ]]; then
+            return 1
+          fi
+        fi
+      fi
+    fi
+    return 0
+  }
+
   FRESH_HERMES=""
   for fresh_candidate in \
       "$RUNTIME_ROOT/.hermes/hermes-agent/venv/bin/hermes" \
@@ -552,7 +591,7 @@ if [[ -n "$RUNTIME_ROOT" ]]; then
       "$HOME/.hermes/hermes-agent/venv/bin/hermes" \
       "$HOME/.hermes/bin/hermes" \
       /usr/local/bin/hermes; do
-    if is_usable_hermes_binary "$fresh_candidate" 2>/dev/null; then
+    if is_fresh_hermes_binary "$fresh_candidate" 2>/dev/null; then
       FRESH_HERMES="$fresh_candidate"
       break
     fi
@@ -567,6 +606,12 @@ if [[ -n "$RUNTIME_ROOT" ]]; then
   RESOLVED_HERMES="$(readlink -f "$FRESH_HERMES" 2>/dev/null || true)"
   if [[ -z "$RESOLVED_HERMES" || ! -x "$RESOLVED_HERMES" ]]; then
     RESOLVED_HERMES="$FRESH_HERMES"
+  fi
+
+  # Final guard: never point the managed wrapper at itself.
+  if [[ "$RESOLVED_HERMES" == "$RUNTIME_ROOT/.local/bin/hermes" ]]; then
+    echo "ERROR: resolved Hermes binary is the managed wrapper itself: ${RESOLVED_HERMES}" >&2
+    exit 1
   fi
 
   echo "qbit-hermes-agent-install: using freshly-installed binary ${RESOLVED_HERMES}"
@@ -585,6 +630,14 @@ WRAPPER_EOF
   chmod +x "$RUNTIME_ROOT/.local/bin/hermes"
 
   ln -sfn "$RESOLVED_HERMES" "$RUNTIME_ROOT/hermes-agent/venv/bin/hermes"
+
+  # Smoke-test: the wrapper must not E2BIG and must respond to --version.
+  if ! "$RUNTIME_ROOT/.local/bin/hermes" --version >/dev/null 2>&1; then
+    echo "ERROR: managed Hermes wrapper failed --version smoke test (exec -> ${RESOLVED_HERMES})" >&2
+    echo "Wrapper contents:" >&2
+    cat "$RUNTIME_ROOT/.local/bin/hermes" >&2 || true
+    exit 1
+  fi
 
   echo "Wrapper + symlink created in $RUNTIME_ROOT (exec -> ${RESOLVED_HERMES})"
 fi
