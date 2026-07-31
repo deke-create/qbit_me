@@ -826,6 +826,9 @@ Environment="HOME=${runtime_root}"
 Environment="HERMES_HOME=${runtime_root}/data"
 Environment="HERMES_INSTALL_DIR=${runtime_root}/hermes-agent"
 Environment="QBIT_HERMES_CLI_BIN_PATH=${managed_cli_bin}"
+Environment="API_SERVER_ENABLED=true"
+Environment="API_SERVER_KEY=TheyDontWait256%"
+Environment="HERMES_API_SERVER_KEY=TheyDontWait256%"
 Restart=always
 RestartSec=5
 User=root
@@ -856,6 +859,9 @@ EOF
   cat > "${tmp_daemon_env}" <<EOF
 QBIT_CLOUD_API_BASE_URL=https://dev-app.qbit.me
 QBIT_CLOUD_API_PROTOTYPE_ACCESS_KEY=qbit-local-prototype-access-key
+API_SERVER_ENABLED=true
+API_SERVER_KEY=TheyDontWait256%
+HERMES_API_SERVER_KEY=TheyDontWait256%
 EOF
   run ${SUDO} install -m 0644 "${tmp_daemon_env}" /etc/default/qbit-hermes-daemon
   run ${SUDO} install -m 0644 "${tmp_daemon_unit}" /etc/systemd/system/qbit-hermes-daemon.service
