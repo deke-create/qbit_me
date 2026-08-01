@@ -1013,31 +1013,48 @@ EOF
 }
 
 finish_cli() {
-  local example_path="${SHARE_DIR}/examples/setup.openai.yaml"
   cat <<EOF
 ✓ CLI setup selected.
 
-  1. Copy or write a setup config (secrets via \${ENV}):
-       qbit-setup validate --file /path/to/setup.yaml
-  2. Apply and wait for Phase 3:
-       export OPENAI_API_KEY=...   # or provider-specific secrets
-       qbit-setup apply --file /path/to/setup.yaml --wait
-  3. Check status / claim code anytime:
-       qbit-setup status
+  Launch the interactive wizard (same steps as the browser UI):
+
+    qbit-setup wizard
+
+  Or non-interactive / automation:
+
+    qbit-setup validate --file /path/to/setup.yaml
+    export OPENAI_API_KEY=...
+    qbit-setup apply --file /path/to/setup.yaml --wait
+    qbit-setup status
 
   Example config:
-       ${example_path}
+       ${SHARE_DIR}/examples/setup.openai.yaml
        (repo checkout: device/crates/qbit-me-setup/examples/setup.openai.yaml)
 
   Gateways are optional. qbit-setup talks to loopback local-api only
   (http://${SETUP_BIND_ADDRESS}/) with header x-qbit-local-write: setup-cli.
 EOF
-  if [[ "${dry_run}" -eq 0 ]] && command -v qbit-setup >/dev/null 2>&1; then
-    log "Checking local-api reachability via qbit-setup status…"
-    qbit-setup --api-base "http://${SETUP_BIND_ADDRESS}" status 2>/dev/null || warn "qbit-setup status could not reach local-api yet; it may still be starting."
-  elif [[ "${dry_run}" -eq 0 ]] && [[ -x "${INSTALL_DIR}/qbit-setup" ]]; then
-    log "Checking local-api reachability via ${INSTALL_DIR}/qbit-setup status…"
-    "${INSTALL_DIR}/qbit-setup" --api-base "http://${SETUP_BIND_ADDRESS}" status 2>/dev/null || warn "qbit-setup status could not reach local-api yet; it may still be starting."
+  local setup_bin=""
+  if command -v qbit-setup >/dev/null 2>&1; then
+    setup_bin="qbit-setup"
+  elif [[ -x "${INSTALL_DIR}/qbit-setup" ]]; then
+    setup_bin="${INSTALL_DIR}/qbit-setup"
+  fi
+  if [[ "${dry_run}" -eq 0 ]] && [[ -n "${setup_bin}" ]]; then
+    if [[ -t 0 ]] && [[ -t 1 ]]; then
+      log "Starting interactive setup wizard…"
+      # shellcheck disable=SC2086
+      if ! "${setup_bin}" --api-base "http://${SETUP_BIND_ADDRESS}" wizard; then
+        warn "Wizard exited non-zero. Re-run later: ${setup_bin} wizard"
+      fi
+    else
+      log "Checking local-api reachability via ${setup_bin} status…"
+      "${setup_bin}" --api-base "http://${SETUP_BIND_ADDRESS}" status 2>/dev/null \
+        || warn "qbit-setup status could not reach local-api yet; it may still be starting."
+      echo
+      echo "No TTY for wizard. Run interactively:"
+      echo "  ${setup_bin} wizard"
+    fi
   fi
 }
 
