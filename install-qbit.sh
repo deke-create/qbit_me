@@ -21,15 +21,20 @@ set -euo pipefail
 #                                     engine (a linked library, not a separate
 #                                     binary)
 #        - qbit-me-daemon      (required)  runtime health + cloud bridge
+#        - qbit-setup          (required)  headless CLI finish path over local-api
 #        - qbit-me-ble         (optional)  only with --with-ble
 #   5. Installs the browser setup UI bundle and a `qbit-hermes-setup` launcher
 #      that serves it over http://127.0.0.1:8081 via qbit-me-local-api.
+#   6. After host prep, offers an explicit GUI / CLI / Skip finish-path chooser
+#      (never auto-detects from DISPLAY/SSH/environment).
 #
 # It explicitly DOES NOT:
 #   - Touch or interfere with the mobile app + BLE onboarding path.
 #   - Overwrite or modify an existing Hermes installation.
 #   - Install a desktop icon or auto-launch/boot service (browser-access only).
 #   - Configure host network / Wi-Fi.
+#   - Auto-select GUI vs CLI from environment signals.
+#   - Silently auto-apply a setup file (no --setup-file in v1).
 #
 # Binaries can be obtained two ways:
 #   - Download: architecture-specific artifacts from $QBIT_RELEASE_BASE_URL.
@@ -52,6 +57,9 @@ with_ble=0
 skip_hermes=0
 dry_run=0
 assume_yes=0
+# finish path: empty = prompt when interactive; gui|cli|skip when set via --finish
+finish_path=""
+finish_only=0
 
 # ── Output helpers ────────────────────────────────────────────────────────────
 log()  { printf '→ %s\n' "$*"; }
@@ -96,8 +104,9 @@ usage() {
   cat <<EOF
 Usage: ${PROGRAM_NAME} [options]
 
-BYOH installer for qbit.me. Prepares a macOS, Ubuntu, or Raspberry Pi host and
-then hands off to a local browser-based setup experience.
+BYOH installer for qbit.me. Prepares a macOS, Ubuntu, or Raspberry Pi host, then
+lets you choose how to finish setup (GUI browser UI, CLI via qbit-setup, or Skip).
+Never auto-detects GUI vs CLI from the environment.
 
 Options:
   --source                 Build binaries (cargo) and setup UI (npm) from a repo
@@ -111,7 +120,10 @@ Options:
   --with-ble               Also install the optional qbit-me-ble binary.
   --skip-hermes            Do not install Hermes even if it is missing.
   --hermes-install-url <u> Override the official Hermes installer URL.
-  -y, --yes                Do not prompt for confirmation.
+  --finish gui|cli|skip    Select finish path without prompting (automation).
+  --finish-only            Re-run only the finish-path step (assumes already installed).
+  -y, --yes                Do not prompt for confirmation; non-interactive host prep.
+                           Finish path defaults to skip unless --finish is set.
   --dry-run                Print the actions without changing the system.
   -h, --help               Show this help.
 
@@ -131,6 +143,17 @@ while [[ $# -gt 0 ]]; do
     --with-ble) with_ble=1 ;;
     --skip-hermes) skip_hermes=1 ;;
     --hermes-install-url) shift; [[ $# -gt 0 ]] || die "Missing value for --hermes-install-url"; QBIT_HERMES_INSTALL_URL="$1" ;;
+    --finish)
+      shift
+      [[ $# -gt 0 ]] || die "Missing value for --finish"
+      case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in
+        gui|1) finish_path=gui ;;
+        cli|2) finish_path=cli ;;
+        skip|3) finish_path=skip ;;
+        *) die "Invalid --finish value '$1' (expected gui|cli|skip)" ;;
+      esac
+      ;;
+    --finish-only) finish_only=1 ;;
     -y|--yes) assume_yes=1 ;;
     --dry-run) dry_run=1 ;;
     -h|--help) usage; exit 0 ;;
@@ -316,9 +339,15 @@ download_to() {
 # ── Resolve binary set ────────────────────────────────────────────────────────
 # qbit-me-provisioner is the install/runtime engine, but it is a library crate that
 # is statically linked into qbit-me-local-api rather than a standalone binary, so the
-# installable binaries are qbit-me-local-api (which embeds the provisioner) and
-# qbit-me-daemon, plus the optional qbit-me-ble.
-required_binaries=(qbit-me-local-api qbit-me-daemon)
+# installable binaries are qbit-me-local-api (which embeds the provisioner),
+# qbit-me-daemon, qbit-setup (crate qbit-me-setup; binary name differs), plus the
+# optional qbit-me-ble.
+# Binary names installed into INSTALL_DIR (download artifact names match).
+required_binaries=(qbit-me-local-api qbit-me-daemon qbit-setup)
+# Cargo package names for same-name crates only (qbit-setup is handled separately).
+required_cargo_packages=(qbit-me-local-api qbit-me-daemon)
+SETUP_CLI_CRATE="qbit-me-setup"
+SETUP_CLI_BIN="qbit-setup"
 optional_binaries=()
 if [[ "${with_ble}" -eq 1 ]]; then
   optional_binaries+=(qbit-me-ble)
@@ -341,10 +370,12 @@ build_from_source() {
   command -v cargo >/dev/null 2>&1 || die "--source requires cargo (Rust toolchain) on PATH."
 
   local crate
-  for crate in "${required_binaries[@]}" "${optional_binaries[@]}"; do
+  for crate in "${required_cargo_packages[@]}" "${optional_binaries[@]}"; do
     log "Building ${crate} (release)…"
     run sh -c "cd '${device_dir}' && cargo build --release -p '${crate}'"
   done
+  log "Building ${SETUP_CLI_CRATE} / ${SETUP_CLI_BIN} (release)…"
+  run sh -c "cd '${device_dir}' && cargo build --release -p '${SETUP_CLI_CRATE}'"
 
   SOURCE_BIN_DIR="${device_dir}/target/release"
 
@@ -359,6 +390,9 @@ build_from_source() {
     warn "setup-ui source not found at ${ui_src}; skipping UI build."
     SOURCE_UI_DIR=""
   fi
+
+  # Ship example YAML configs next to the setup UI share tree.
+  SOURCE_SETUP_EXAMPLES_DIR="${device_dir}/crates/qbit-me-setup/examples"
 }
 
 # ── Download build path ───────────────────────────────────────────────────────
@@ -731,64 +765,6 @@ confirm() {
   esac
 }
 
-# ── Main ──────────────────────────────────────────────────────────────────────
-main() {
-  printf '== qbit.me BYOH installer ==\n\n'
-
-  detect_platform
-  echo
-
-  detect_hermes
-  if [[ "${HERMES_FOUND}" -eq 1 ]]; then
-    ok "Hermes already installed (${HERMES_DETAIL}); installing qbit.me around it."
-  else
-    if [[ "${skip_hermes}" -eq 1 ]]; then
-      warn "Hermes not detected and --skip-hermes was set; the browser setup will block until Hermes is available."
-    else
-      log "Hermes not detected; it will be installed first."
-    fi
-  fi
-  echo
-
-  printf 'Plan:\n'
-  printf '  - Install dir : %s\n' "${INSTALL_DIR}"
-  printf '  - Setup UI    : %s\n' "${SETUP_UI_DIR:-${SHARE_DIR}/setup-ui}"
-  printf '  - Binaries    : %s%s\n' "${required_binaries[*]}" \
-    "$([[ ${#optional_binaries[@]} -gt 0 ]] && printf ' %s' "${optional_binaries[*]}")"
-  printf '  - Source mode : %s\n' "$([[ ${use_source} -eq 1 ]] && echo yes || echo 'no (download)')"
-  echo
-  confirm
-  echo
-
-  if [[ "${HERMES_FOUND}" -eq 0 ]] && [[ "${skip_hermes}" -eq 0 ]]; then
-    install_hermes
-    echo
-  fi
-
-  resolve_install_dir
-
-  if [[ "${use_source}" -eq 1 ]]; then
-    build_from_source
-  else
-    download_artifacts
-  fi
-  echo
-
-  local name
-  for name in "${required_binaries[@]}" "${optional_binaries[@]}"; do
-    install_binary_file "${SOURCE_BIN_DIR}/${name}" "${name}"
-  done
-  echo
-
-  install_provisioner_hook
-  install_systemd_units
-  install_setup_ui
-  install_launcher
-  echo
-
-  print_post_install
-}
-
 # ── Install systemd service units for the daemon (and local-api) ──────────────
 # On the normal Pi appliance, deploy_device.sh installs these units. On BYOH,
 # we install adapted versions that point at the user-local data root instead of
@@ -968,29 +944,290 @@ repair_user_hermes_cli() {
 }
 
 print_post_install() {
-  cat <<EOF
-✓ qbit.me BYOH installation complete.
+  # Back-compat name: finish-path chooser is the real post-install step.
+  run_finish_path_step
+}
 
-The local setup server is running now. Open this URL in your browser
-to complete the guided setup (device name, timezone, providers, gateways)
-and watch install progress:
+is_interactive_tty() {
+  [[ -t 0 ]] && [[ -t 1 ]]
+}
+
+normalize_finish_choice() {
+  local raw
+  raw="$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+  case "${raw}" in
+    1|gui) echo gui ;;
+    2|cli) echo cli ;;
+    3|skip|"") echo skip ;;
+    *) echo "" ;;
+  esac
+}
+
+print_finish_instructions_all() {
+  cat <<EOF
+How to finish setup later:
+
+  GUI  — open the guided browser setup UI:
+           http://${SETUP_BIND_ADDRESS}/
+         (or re-run: ${PROGRAM_NAME} --finish-only --finish gui)
+
+  CLI  — terminal setup with qbit-setup:
+           qbit-setup validate --file /path/to/setup.yaml
+           export OPENAI_API_KEY=...   # or provider-specific secrets
+           qbit-setup apply --file /path/to/setup.yaml --wait
+           qbit-setup status
+         Example configs:
+           ${SHARE_DIR}/examples/setup.openai.yaml
+           (repo: device/crates/qbit-me-setup/examples/)
+         (or re-run: ${PROGRAM_NAME} --finish-only --finish cli)
+
+  Skip — host prep only; finish when ready with either path above.
+
+Automation: ${PROGRAM_NAME} -y --finish gui|cli|skip
+EOF
+}
+
+finish_gui() {
+  cat <<EOF
+✓ GUI setup selected.
+
+  Open the guided browser setup UI:
 
     http://${SETUP_BIND_ADDRESS}/
+
+  Complete device name, timezone, provider, and optional gateways there.
+  Local setup API is already running.
+EOF
+  # Best-effort browser open ONLY because the operator chose GUI.
+  if [[ "${dry_run}" -eq 1 ]]; then
+    printf '   [dry-run] xdg-open/open http://%s/\n' "${SETUP_BIND_ADDRESS}"
+    return 0
+  fi
+  if command -v xdg-open >/dev/null 2>&1; then
+    xdg-open "http://${SETUP_BIND_ADDRESS}/" >/dev/null 2>&1 || warn "Could not open a browser automatically; open the URL manually."
+  elif command -v open >/dev/null 2>&1; then
+    open "http://${SETUP_BIND_ADDRESS}/" >/dev/null 2>&1 || warn "Could not open a browser automatically; open the URL manually."
+  else
+    warn "No xdg-open/open available; open the URL manually."
+  fi
+}
+
+finish_cli() {
+  local example_path="${SHARE_DIR}/examples/setup.openai.yaml"
+  cat <<EOF
+✓ CLI setup selected.
+
+  1. Copy or write a setup config (secrets via \${ENV}):
+       qbit-setup validate --file /path/to/setup.yaml
+  2. Apply and wait for Phase 3:
+       export OPENAI_API_KEY=...   # or provider-specific secrets
+       qbit-setup apply --file /path/to/setup.yaml --wait
+  3. Check status / claim code anytime:
+       qbit-setup status
+
+  Example config:
+       ${example_path}
+       (repo checkout: device/crates/qbit-me-setup/examples/setup.openai.yaml)
+
+  Gateways are optional. qbit-setup talks to loopback local-api only
+  (http://${SETUP_BIND_ADDRESS}/) with header x-qbit-local-write: setup-cli.
+EOF
+  if [[ "${dry_run}" -eq 0 ]] && command -v qbit-setup >/dev/null 2>&1; then
+    log "Checking local-api reachability via qbit-setup status…"
+    qbit-setup --api-base "http://${SETUP_BIND_ADDRESS}" status 2>/dev/null || warn "qbit-setup status could not reach local-api yet; it may still be starting."
+  elif [[ "${dry_run}" -eq 0 ]] && [[ -x "${INSTALL_DIR}/qbit-setup" ]]; then
+    log "Checking local-api reachability via ${INSTALL_DIR}/qbit-setup status…"
+    "${INSTALL_DIR}/qbit-setup" --api-base "http://${SETUP_BIND_ADDRESS}" status 2>/dev/null || warn "qbit-setup status could not reach local-api yet; it may still be starting."
+  fi
+}
+
+finish_skip() {
+  cat <<EOF
+✓ Skipping finish setup for now.
+
+  Local setup API: http://${SETUP_BIND_ADDRESS}/
+  GUI path: open that URL in a browser
+  CLI path: qbit-setup --help
 
 Installed binaries (in ${INSTALL_DIR}):
   - qbit-me-local-api (embeds the qbit-me-provisioner install/runtime engine)
   - qbit-me-daemon
+  - qbit-setup (headless finish path)
   - qbit-me-ble (--with-ble only)
 
 Installed systemd services:
-  - qbit-hermes-local-api.service (enabled + started; serving the setup UI now)
+  - qbit-hermes-local-api.service (enabled + started)
   - qbit-hermes-daemon.service (enabled, starts on boot)
   - qbit-hermes-gateway.service (installed by provisioner during setup)
 
 Notes:
   - The mobile app + BLE onboarding path is unaffected by this installer.
   - No host network / Wi-Fi configuration was changed.
+  - Finish path is never auto-detected from DISPLAY/SSH/environment.
 EOF
+}
+
+prompt_finish_path() {
+  local choice="" attempt=0 normalized=""
+  while [[ ${attempt} -lt 5 ]]; do
+    cat <<EOF
+
+How do you want to finish setup?
+
+  1) GUI  — guided browser setup UI
+  2) CLI  — terminal setup with qbit-setup
+  3) Skip — I'll finish later
+
+EOF
+    printf 'Select [1/2/3]: '
+    if ! read -r choice; then
+      echo
+      warn "No input; defaulting to Skip."
+      echo skip
+      return 0
+    fi
+    normalized="$(normalize_finish_choice "${choice}")"
+    if [[ -n "${normalized}" && "${normalized}" != "skip" ]] || [[ "${choice}" =~ ^([3Ss]|[Ss][Kk][Ii][Pp])$ ]]; then
+      if [[ -z "${normalized}" ]]; then
+        # empty normalize only for blank; treat explicit skip
+        :
+      fi
+    fi
+    normalized="$(normalize_finish_choice "${choice}")"
+    if [[ -n "${normalized}" ]]; then
+      # Accept empty input as invalid, not skip — only 3/skip maps to skip.
+      if [[ -z "${choice// }" ]]; then
+        warn "Empty selection."
+      else
+        echo "${normalized}"
+        return 0
+      fi
+    else
+      warn "Invalid selection '${choice}'."
+    fi
+    attempt=$((attempt + 1))
+  done
+  warn "Too many invalid attempts; defaulting to Skip."
+  echo skip
+}
+
+run_finish_path_step() {
+  local selected="${finish_path}"
+
+  cat <<EOF
+✓ qbit.me host preparation complete.
+  Local setup API: http://${SETUP_BIND_ADDRESS}/
+EOF
+
+  if [[ -z "${selected}" ]]; then
+    if [[ "${assume_yes}" -eq 1 ]] || ! is_interactive_tty; then
+      # Non-interactive: do not prompt and do not auto-pick from environment.
+      echo
+      print_finish_instructions_all
+      return 0
+    fi
+    selected="$(prompt_finish_path)"
+  fi
+
+  echo
+  case "${selected}" in
+    gui) finish_gui ;;
+    cli) finish_cli ;;
+    skip) finish_skip ;;
+    *)
+      warn "Unknown finish path '${selected}'; printing instructions."
+      print_finish_instructions_all
+      ;;
+  esac
+}
+
+install_setup_examples() {
+  local dest="${SHARE_DIR}/examples"
+  local src="${SOURCE_SETUP_EXAMPLES_DIR:-}"
+  if [[ -z "${src}" ]] || [[ ! -d "${src}" ]]; then
+    # Download mode may not ship examples tarball in v1; leave a pointer only.
+    if [[ "${dry_run}" -eq 1 ]]; then
+      printf '   [dry-run] mkdir -p %s (examples if available)\n' "${dest}"
+      return 0
+    fi
+    return 0
+  fi
+  log "Installing setup examples to ${dest}…"
+  run ${SUDO} mkdir -p "${dest}"
+  local f
+  for f in "${src}"/*.yaml; do
+    [[ -f "${f}" ]] || continue
+    run ${SUDO} install -m 0644 "${f}" "${dest}/$(basename "${f}")"
+  done
+  ok "Setup examples installed under ${dest}"
+}
+
+main() {
+  if [[ "${finish_only}" -eq 1 ]]; then
+    resolve_install_dir
+    run_finish_path_step
+    return 0
+  fi
+
+  printf '== qbit.me BYOH installer ==\n\n'
+
+  detect_platform
+  echo
+
+  detect_hermes
+  if [[ "${HERMES_FOUND}" -eq 1 ]]; then
+    ok "Hermes already installed (${HERMES_DETAIL}); installing qbit.me around it."
+  else
+    if [[ "${skip_hermes}" -eq 1 ]]; then
+      warn "Hermes not detected and --skip-hermes was set; setup will block until Hermes is available."
+    else
+      log "Hermes not detected; it will be installed first."
+    fi
+  fi
+  echo
+
+  printf 'Plan:\n'
+  printf '  - Install dir : %s\n' "${INSTALL_DIR}"
+  printf '  - Setup UI    : %s\n' "${SETUP_UI_DIR:-${SHARE_DIR}/setup-ui}"
+  printf '  - Binaries    : %s%s\n' "${required_binaries[*]}" \
+    "$([[ ${#optional_binaries[@]} -gt 0 ]] && printf ' %s' "${optional_binaries[*]}")"
+  printf '  - Source mode : %s\n' "$([[ ${use_source} -eq 1 ]] && echo yes || echo 'no (download)')"
+  if [[ -n "${finish_path}" ]]; then
+    printf '  - Finish path : %s\n' "${finish_path}"
+  fi
+  echo
+  confirm
+  echo
+
+  if [[ "${HERMES_FOUND}" -eq 0 ]] && [[ "${skip_hermes}" -eq 0 ]]; then
+    install_hermes
+    echo
+  fi
+
+  resolve_install_dir
+
+  SOURCE_SETUP_EXAMPLES_DIR=""
+  if [[ "${use_source}" -eq 1 ]]; then
+    build_from_source
+  else
+    download_artifacts
+  fi
+  echo
+
+  local name
+  for name in "${required_binaries[@]}" "${optional_binaries[@]}"; do
+    install_binary_file "${SOURCE_BIN_DIR}/${name}" "${name}"
+  done
+  echo
+
+  install_provisioner_hook
+  install_systemd_units
+  install_setup_ui
+  install_launcher
+  install_setup_examples
+  echo
+
+  run_finish_path_step
 }
 
 main "$@"

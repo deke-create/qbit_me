@@ -206,6 +206,7 @@ remove_binaries() {
   local bins=(
     qbit-me-local-api
     qbit-me-daemon
+    qbit-setup
     qbit-me-ble
     qbit-hermes-agent-install
     qbit-hermes-setup
