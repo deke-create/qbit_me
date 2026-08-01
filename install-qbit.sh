@@ -971,14 +971,10 @@ How to finish setup later:
            http://${SETUP_BIND_ADDRESS}/
          (or re-run: ${PROGRAM_NAME} --finish-only --finish gui)
 
-  CLI  — terminal setup with qbit-setup:
-           qbit-setup validate --file /path/to/setup.yaml
-           export OPENAI_API_KEY=...   # or provider-specific secrets
-           qbit-setup apply --file /path/to/setup.yaml --wait
-           qbit-setup status
-         Example configs:
-           ${SHARE_DIR}/examples/setup.openai.yaml
-           (repo: device/crates/qbit-me-setup/examples/)
+  CLI  — run the interactive setup wizard (same flow as the browser UI):
+           qbit-setup
+         The wizard remembers your progress — re-run anytime to continue,
+         resume after a failure, or follow an in-progress install.
          (or re-run: ${PROGRAM_NAME} --finish-only --finish cli)
 
   Skip — host prep only; finish when ready with either path above.
@@ -1016,23 +1012,18 @@ finish_cli() {
   cat <<EOF
 ✓ CLI setup selected.
 
-  Launch the interactive wizard (same steps as the browser UI):
+  Run the interactive setup wizard — it steps you through device name,
+  timezone, messaging, AI provider, and optional cloud registration:
 
-    qbit-setup wizard
+    qbit-setup
 
-  Or non-interactive / automation:
+  The wizard is state-aware: if you stop halfway, just re-run qbit-setup
+  and it picks up where you left off. If an install fails, it offers
+  resume from the last checkpoint or restart from scratch.
 
-    qbit-setup validate --file /path/to/setup.yaml
-    export OPENAI_API_KEY=...
-    qbit-setup apply --file /path/to/setup.yaml --wait
-    qbit-setup status
+  For non-interactive / automation only:
+    qbit-setup apply --file setup.yaml --wait
 
-  Example config:
-       ${SHARE_DIR}/examples/setup.openai.yaml
-       (repo checkout: device/crates/qbit-me-setup/examples/setup.openai.yaml)
-
-  Gateways are optional. qbit-setup talks to loopback local-api only
-  (http://${SETUP_BIND_ADDRESS}/) with header x-qbit-local-write: setup-cli.
 EOF
   local setup_bin=""
   if command -v qbit-setup >/dev/null 2>&1; then
@@ -1045,15 +1036,15 @@ EOF
       log "Starting interactive setup wizard…"
       # shellcheck disable=SC2086
       if ! "${setup_bin}" --api-base "http://${SETUP_BIND_ADDRESS}" wizard; then
-        warn "Wizard exited non-zero. Re-run later: ${setup_bin} wizard"
+        warn "Wizard exited non-zero. Re-run later: ${setup_bin}"
       fi
     else
       log "Checking local-api reachability via ${setup_bin} status…"
       "${setup_bin}" --api-base "http://${SETUP_BIND_ADDRESS}" status 2>/dev/null \
         || warn "qbit-setup status could not reach local-api yet; it may still be starting."
       echo
-      echo "No TTY for wizard. Run interactively:"
-      echo "  ${setup_bin} wizard"
+      echo "No TTY for wizard. Run interactively (SSH session):"
+      echo "  ${setup_bin}"
     fi
   fi
 }
