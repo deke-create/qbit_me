@@ -1493,6 +1493,46 @@ main() {
     return 0
   fi
 
+  # Detect if qbit is already installed. If so, offer the finish-path menu
+  # instead of re-running the full install — conversational, no flags needed.
+  if [[ -z "${finish_path}" ]] && is_interactive_tty; then
+    if command -v qbit-me-local-api >/dev/null 2>&1 || [[ -x "${INSTALL_DIR}/qbit-me-local-api" ]]; then
+      cat <<EOF
+== qbit.me already installed ==
+
+  qbit is detected on this device. What would you like to do?
+
+  1) Finish setup — choose how to finish (GUI / CLI / IoT / Skip)
+  2) Reinstall     — re-run the full install (update binaries + setup UI)
+  3) Cancel
+
+EOF
+      local reinstall_choice=""
+      while true; do
+        printf 'Select [1/2/3]: '
+        if ! read -r reinstall_choice; then
+          echo
+          return 0
+        fi
+        case "${reinstall_choice}" in
+          1|"")
+            run_finish_path_step
+            return 0
+            ;;
+          2)
+            break
+            ;;
+          3)
+            return 0
+            ;;
+          *)
+            warn "Invalid choice. Enter 1, 2, or 3."
+            ;;
+        esac
+      done
+    fi
+  fi
+
   printf '== qbit.me BYOH installer ==\n\n'
 
   detect_platform
