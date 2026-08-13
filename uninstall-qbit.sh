@@ -17,7 +17,8 @@ set -euo pipefail
 #        qbit-hermes-setup (launcher)
 #   3. Removes the setup UI bundle under the share dir.
 #   4. Removes BYOH user data (bootstrap state, runtime tree, health history,
-#      cloud-bridge state, staged config/secrets, install progress).
+#      cloud-bridge state, staged config/secrets, install progress, IoT adapter
+#      config + encrypted secrets under iot/).
 #   5. Removes the managed runtime tree (if present) created by the provisioner.
 #
 # It explicitly DOES NOT:
@@ -248,14 +249,15 @@ remove_user_data() {
   if [[ -d "${DATA_DIR}" ]]; then
     log "Removing BYOH user data ${DATA_DIR}"
     # The provisioner and daemon run as root and create root-owned files
-    # (state, secrets, managed runtime tree) inside the user's data dir.
+    # (state, secrets, managed runtime tree, IoT adapter config + encrypted
+    # secrets under iot/) inside the user's data dir.
     # Use sudo to ensure root-owned files are removed cleanly.
     if [[ -n "${SUDO}" ]]; then
       run ${SUDO} rm -rf "${DATA_DIR}"
     else
       run rm -rf "${DATA_DIR}"
     fi
-    ok "BYOH user data removed."
+    ok "BYOH user data removed (including IoT adapter config + secrets)."
   else
     ok "No BYOH user data found at ${DATA_DIR}."
   fi

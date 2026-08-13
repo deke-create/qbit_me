@@ -120,8 +120,9 @@ Options:
   --with-ble               Also install the optional qbit-me-ble binary.
   --skip-hermes            Do not install Hermes even if it is missing.
   --hermes-install-url <u> Override the official Hermes installer URL.
-  --finish gui|cli|skip    Select finish path without prompting (automation).
-  --finish-only            Re-run only the finish-path step (assumes already installed).
+  --finish gui|cli|iot|skip  Select finish path without prompting (automation).
+  --finish-only            Re-run the finish-path chooser (assumes already installed).
+                           Shows the interactive menu (GUI / CLI / IoT / Skip) — no --finish flag needed.
   -y, --yes                Do not prompt for confirmation; non-interactive host prep.
                            Finish path defaults to skip unless --finish is set.
   --dry-run                Print the actions without changing the system.
@@ -149,8 +150,9 @@ while [[ $# -gt 0 ]]; do
       case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in
         gui|1) finish_path=gui ;;
         cli|2) finish_path=cli ;;
-        skip|3) finish_path=skip ;;
-        *) die "Invalid --finish value '$1' (expected gui|cli|skip)" ;;
+        iot|3) finish_path=iot ;;
+        skip|4) finish_path=skip ;;
+        *) die "Invalid --finish value '$1' (expected gui|cli|iot|skip)" ;;
       esac
       ;;
     --finish-only) finish_only=1 ;;
@@ -342,6 +344,11 @@ download_to() {
 # installable binaries are qbit-me-local-api (which embeds the provisioner),
 # qbit-me-daemon, qbit-setup (crate qbit-me-setup; binary name differs), plus the
 # optional qbit-me-ble.
+#
+# qbit-me-iot is also a library crate, statically linked into qbit-me-daemon. It
+# provides the MQTT/REST/Home Assistant IoT adapters and the descriptor ingest
+# module. No separate binary is needed — building qbit-me-daemon pulls it in.
+# IoT adapter config and encrypted secrets live under /var/lib/qbit-hermes/iot/.
 # Binary names installed into INSTALL_DIR (download artifact names match).
 required_binaries=(qbit-me-local-api qbit-me-daemon qbit-setup)
 # Cargo package names for same-name crates only (qbit-setup is handled separately).
@@ -765,6 +772,30 @@ confirm() {
   esac
 }
 
+# ── Resolve the managed Hermes API server port ────────────────────────────────
+# BYOH contract: never move or share the operator's existing API server port.
+# The upstream Hermes default is 8642. If the operator's personal Hermes is
+# already bound there, move the qbit.me-managed instance to 8643 (or the next
+# free port in a short window above it). When 8642 is free, keep it so a fresh
+# appliance matches the upstream default.
+resolve_managed_api_server_port() {
+  local host="127.0.0.1"
+  local port=8642
+  # /dev/tcp bash builtin: opening for write attempts a connect; if the connect
+  # succeeds someone is already listening there.
+  for port in 8642 8643 8644 8645 8646 8647 8648 8649 8650; do
+    if ! (exec 3<>"/dev/tcp/${host}/${port}") 2>/dev/null; then
+      QBIT_MANAGED_API_SERVER_PORT="${port}"
+      return 0
+    fi
+    # Close the fd we just opened so we don't leak it.
+    exec 3>&- 2>/dev/null || true
+  done
+  # All candidates taken — fall back to 8643 and let the gateway surface the
+  # bind error rather than aborting the install.
+  QBIT_MANAGED_API_SERVER_PORT=8643
+}
+
 # ── Install systemd service units for the daemon (and local-api) ──────────────
 # On the normal Pi appliance, deploy_device.sh installs these units. On BYOH,
 # we install adapted versions that point at the user-local data root instead of
@@ -772,6 +803,8 @@ confirm() {
 # because the daemon needs root for systemctl operations, service management,
 # and file access within the managed runtime tree.
 install_systemd_units() {
+  resolve_managed_api_server_port
+  log "Managed API server port: ${QBIT_MANAGED_API_SERVER_PORT} (8642 taken by operator's existing Hermes → moved; otherwise kept)"
   local data_root="${XDG_DATA_HOME:-${HOME}/.local/share}/qbit-hermes"
   local setup_root="${data_root}/setup"
   local legacy_setup_root="${data_root}/setup/setup"
@@ -805,6 +838,8 @@ Environment="QBIT_HERMES_CLI_BIN_PATH=${managed_cli_bin}"
 Environment="API_SERVER_ENABLED=true"
 Environment="API_SERVER_KEY=TheyDontWait256%"
 Environment="HERMES_API_SERVER_KEY=TheyDontWait256%"
+Environment="API_SERVER_PORT=${QBIT_MANAGED_API_SERVER_PORT}"
+Environment="HERMES_API_SERVER_PORT=${QBIT_MANAGED_API_SERVER_PORT}"
 Restart=always
 RestartSec=5
 User=root
@@ -838,6 +873,8 @@ QBIT_CLOUD_API_PROTOTYPE_ACCESS_KEY=qbit-local-prototype-access-key
 API_SERVER_ENABLED=true
 API_SERVER_KEY=TheyDontWait256%
 HERMES_API_SERVER_KEY=TheyDontWait256%
+API_SERVER_PORT=${QBIT_MANAGED_API_SERVER_PORT}
+HERMES_API_SERVER_PORT=${QBIT_MANAGED_API_SERVER_PORT}
 EOF
   run ${SUDO} install -m 0644 "${tmp_daemon_env}" /etc/default/qbit-hermes-daemon
   run ${SUDO} install -m 0644 "${tmp_daemon_unit}" /etc/systemd/system/qbit-hermes-daemon.service
@@ -958,7 +995,8 @@ normalize_finish_choice() {
   case "${raw}" in
     1|gui) echo gui ;;
     2|cli) echo cli ;;
-    3|skip|"") echo skip ;;
+    3|iot) echo iot ;;
+    4|skip|"") echo skip ;;
     *) echo "" ;;
   esac
 }
@@ -977,9 +1015,13 @@ How to finish setup later:
          resume after a failure, or follow an in-progress install.
          (or re-run: ${PROGRAM_NAME} --finish-only --finish cli)
 
-  Skip — host prep only; finish when ready with either path above.
+  IoT  — register an IoT device (MQTT, HTTP REST, or Home Assistant):
+           ${PROGRAM_NAME} --finish-only --finish iot
+         Interactive wizard: choose protocol → configure → discover → register.
 
-Automation: ${PROGRAM_NAME} -y --finish gui|cli|skip
+  Skip — host prep only; finish when ready with any path above.
+
+Automation: ${PROGRAM_NAME} -y --finish gui|cli|iot|skip
 EOF
 }
 
@@ -1075,6 +1117,276 @@ Notes:
 EOF
 }
 
+# ── IoT device registration wizard ───────────────────────────────────────────
+# Embedded IoT wizard — same flow as qbit-iot-wizard.sh but integrated
+# into the install script so no separate script is needed.
+
+iot_api_get() {
+  curl -sS "http://${SETUP_BIND_ADDRESS}${1}" 2>/dev/null
+}
+
+iot_api_post() {
+  curl -sS -X POST "http://${SETUP_BIND_ADDRESS}${1}" \
+    -H "Content-Type: application/json" \
+    -H "X-Qbit-Local-Write: setup-ui" \
+    -d "${2}" 2>/dev/null
+}
+
+iot_prompt() {
+  local var_name="$1" prompt_text="$2" default_val="${3:-}"
+  local suffix=""
+  [[ -n "$default_val" ]] && suffix=" [${default_val}]"
+  printf '  %s%s: ' "$prompt_text" "$suffix"
+  read -r "$var_name" || true
+  if [[ -z "${!var_name}" && -n "$default_val" ]]; then
+    eval "$var_name=\"\$default_val\""
+  fi
+}
+
+iot_prompt_secret() {
+  local var_name="$1" prompt_text="$2"
+  printf '  %s: ' "$prompt_text"
+  read -rs "$var_name" || true
+  echo ""
+}
+
+iot_prompt_choice() {
+  local var_name="$1" prompt_text="$2"; shift 2
+  local options=("$@")
+  echo ""
+  echo "  $prompt_text"
+  echo ""
+  for i in "${!options[@]}"; do
+    echo "  $((i+1))) ${options[$i]}"
+  done
+  echo ""
+  while true; do
+    printf '  Select [1-%d]: ' "${#options[@]}"
+    read -r choice || true
+    if [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -ge 1 ]] && [[ "$choice" -le "${#options[@]}" ]]; then
+      eval "$var_name=\"\${options[$((choice-1))]}\""
+      return 0
+    fi
+    warn "Invalid choice. Please enter 1-${#options[@]}."
+  done
+}
+
+iot_confirm() {
+  local prompt_text="$1" default="${2:-y}"
+  local suffix="[Y/n]"; [[ "$default" == "n" ]] && suffix="[y/N]"
+  printf '  %s %s: ' "$prompt_text" "$suffix"
+  read -r reply || true
+  reply="${reply:-$default}"
+  [[ "$reply" =~ ^[Yy] ]]
+}
+
+iot_wizard_full() {
+  echo ""
+  echo "  ── IoT Device Registration Wizard ──"
+  echo ""
+
+  # Step 1: Choose protocol
+  echo ""
+  echo "  ▶ Step 1: Choose IoT protocol"
+  iot_prompt_choice IOT_PROTOCOL \
+    "Which protocol does your IoT device use?" \
+    "MQTT — Zigbee2MQTT, Home Assistant MQTT discovery, ESPHome" \
+    "HTTP REST — Vendor cloud APIs, ESPHome native, webhooks" \
+    "Home Assistant — Hundreds of device types via HA REST API"
+
+  local iot_kind=""
+  case "$IOT_PROTOCOL" in
+    MQTT*) iot_kind="mqtt" ;;
+    HTTP*) iot_kind="httpRest" ;;
+    "Home Assistant"*) iot_kind="homeAssistant" ;;
+  esac
+  echo ""
+  ok "Selected: ${iot_kind}"
+
+  # Step 2: Configure adapter
+  echo ""
+  echo "  ▶ Step 2: Configure adapter"
+  local iot_label iot_body=""
+  iot_prompt iot_label "Adapter label (a friendly name)" "IoT Adapter"
+
+  case "$iot_kind" in
+    mqtt)
+      local broker_url topic_prefix mqtt_user="" mqtt_pass=""
+      iot_prompt broker_url "MQTT broker URL" "tcp://127.0.0.1:1883"
+      iot_prompt topic_prefix "Topic prefix (optional, e.g. zigbee2mqtt/)" ""
+      echo ""
+      if iot_confirm "Does the broker require authentication?"; then
+        iot_prompt mqtt_user "Username" ""
+        iot_prompt_secret mqtt_pass "Password"
+      fi
+      local auth_block=""
+      [[ -n "$mqtt_user" && -n "$mqtt_pass" ]] && auth_block=",\"username\":\"${mqtt_user}\",\"password\":\"${mqtt_pass}\""
+      iot_body="{\"kind\":\"mqtt\",\"label\":\"${iot_label}\",\"config\":{\"type\":\"mqtt\",\"value\":{\"brokerUrl\":\"${broker_url}\",\"clientId\":null${auth_block},\"topicPrefix\":\"${topic_prefix}\",\"discoveryDeadlineSecs\":null,\"maxDevices\":null}}}"
+      ;;
+    httpRest)
+      local base_url ep_key ep_path units auth_choice auth_block
+      iot_prompt base_url "Base URL" "http://192.168.1.50/api"
+      iot_prompt ep_key "Endpoint key (e.g. temperature, battery_level)" "data"
+      iot_prompt ep_path "Endpoint path" "/status"
+      iot_prompt units "Units (optional, e.g. C, %, kWh)" ""
+      iot_prompt_choice auth_choice "Does the REST API require authentication?" \
+        "No auth" "Basic (username + password)" "Bearer token" "Custom header"
+      case "$auth_choice" in
+        "No auth") auth_block='{"type":"none"}' ;;
+        "Basic"*)
+          local rest_user rest_pass
+          iot_prompt rest_user "Username" ""
+          iot_prompt_secret rest_pass "Password"
+          auth_block="{\"type\":\"basic\",\"value\":{\"username\":\"${rest_user}\",\"password\":\"${rest_pass}\"}}"
+          ;;
+        "Bearer"*)
+          local bearer_token
+          iot_prompt_secret bearer_token "Bearer token"
+          auth_block="{\"type\":\"bearer\",\"value\":{\"token\":\"${bearer_token}\"}}"
+          ;;
+        "Custom"*)
+          local hdr_name hdr_value
+          iot_prompt hdr_name "Header name (e.g. X-API-Key)" ""
+          iot_prompt_secret hdr_value "Header value"
+          auth_block="{\"type\":\"header\",\"value\":{\"name\":\"${hdr_name}\",\"value\":\"${hdr_value}\"}}"
+          ;;
+      esac
+      local units_json="null"; [[ -n "$units" ]] && units_json="\"${units}\""
+      iot_body="{\"kind\":\"httpRest\",\"label\":\"${iot_label}\",\"config\":{\"type\":\"httpRest\",\"value\":{\"baseUrl\":\"${base_url}\",\"endpoints\":[{\"key\":\"${ep_key}\",\"path\":\"${ep_path}\",\"units\":${units_json},\"jsonPath\":null}],\"pollIntervalSecs\":null,\"urlPolicy\":null,\"auth\":${auth_block}}}}"
+      ;;
+    homeAssistant)
+      local ha_url ha_token
+      iot_prompt ha_url "Home Assistant URL" "http://192.168.1.100:8123"
+      iot_prompt_secret ha_token "Long-lived access token"
+      iot_body="{\"kind\":\"homeAssistant\",\"label\":\"${iot_label}\",\"config\":{\"type\":\"homeAssistant\",\"value\":{\"baseUrl\":\"${ha_url}\",\"longLivedToken\":\"${ha_token}\",\"pollIntervalSecs\":null,\"urlPolicy\":null}}}"
+      ;;
+  esac
+
+  # Step 3: Save adapter
+  echo ""
+  echo "  ▶ Step 3: Save adapter"
+  log "Saving adapter configuration..."
+  local result adapter_id
+  result=$(iot_api_post "/api/v1/iot/adapters" "$iot_body")
+  if echo "$result" | grep -q '"id"'; then
+    adapter_id=$(echo "$result" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])" 2>/dev/null)
+    ok "Adapter saved: ${adapter_id}"
+  else
+    warn "Failed to save adapter: $result"
+    return 1
+  fi
+
+  # Step 4: Discover devices
+  echo ""
+  echo "  ▶ Step 4: Discover devices"
+  log "Scanning for IoT devices... (may take a few seconds)"
+  local discover_body="$iot_body"
+  local devices_json
+  devices_json=$(iot_api_post "/api/v1/iot/discover" "$discover_body")
+  if ! echo "$devices_json" | grep -q '"sourceProtocol"'; then
+    warn "No devices discovered: $devices_json"
+    return 1
+  fi
+  echo ""
+  local device_count
+  device_count=$(echo "$devices_json" | python3 -c "import sys,json; print(len(json.load(sys.stdin)))" 2>/dev/null)
+  ok "Discovered ${device_count} device(s):"
+  echo ""
+  echo "$devices_json" | python3 -c "
+import sys, json
+devices = json.load(sys.stdin)
+for i, d in enumerate(devices):
+    mfr = d.get('manufacturer') or 'Unknown'
+    model = d.get('model') or 'Unknown'
+    proto = d.get('sourceProtocol', '')
+    endpoints = d.get('endpoints', [])
+    ep_keys = ', '.join(e.get('key', '') for e in endpoints)
+    print(f'  [{i}] {mfr} {model}')
+    print(f'      protocol: {proto}')
+    print(f'      endpoints ({len(endpoints)}): {ep_keys}')
+    print()
+"
+
+  # Step 5: Register device
+  echo ""
+  echo "  ▶ Step 5: Register device"
+  local selected_index=0
+  if [[ "$device_count" -gt 1 ]]; then
+    while true; do
+      printf '  Which device to register? [0-%d]: ' "$((device_count-1))"
+      read -r selected_index || true
+      if [[ "$selected_index" =~ ^[0-9]+$ ]] && [[ "$selected_index" -ge 0 ]] && [[ "$selected_index" -lt "$device_count" ]]; then
+        break
+      fi
+      warn "Invalid choice."
+    done
+  fi
+
+  local device_json bridge_device_id register_body
+  device_json=$(echo "$devices_json" | python3 -c "
+import sys, json
+devices = json.load(sys.stdin)
+print(json.dumps(devices[${selected_index}]))
+" 2>/dev/null)
+  bridge_device_id=$(iot_api_get "/api/v1/diagnostics" | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    did = d.get('cloud_bridge', {}).get('device_id')
+    print(did if did else 'bridge')
+except:
+    print('bridge')
+" 2>/dev/null)
+  register_body=$(python3 -c "
+import json
+device = json.loads('''${device_json}''')
+body = {
+    'adapterId': '${adapter_id}',
+    'discovered': device,
+    'bridgeDeviceId': '${bridge_device_id}',
+    'ownerOrgId': 'pending'
+}
+print(json.dumps(body))
+" 2>/dev/null)
+
+  log "Registering device..."
+  result=$(iot_api_post "/api/v1/iot/register" "$register_body")
+  if echo "$result" | grep -q '"deviceId"'; then
+    local dev_id
+    dev_id=$(echo "$result" | python3 -c "import sys,json; print(json.load(sys.stdin)['descriptor']['deviceId'])" 2>/dev/null)
+    ok "Device registered: ${dev_id}"
+    echo ""
+    echo "  The daemon will upload this device to qbit Cloud on the next sync cycle."
+    echo "  View it at: https://dev-app.qbit.me/iot"
+  else
+    warn "Registration failed: $result"
+    return 1
+  fi
+}
+
+finish_iot() {
+  cat <<EOF
+✓ IoT device registration selected.
+
+  Starting the interactive IoT wizard...
+  (Local setup API: http://${SETUP_BIND_ADDRESS}/)
+
+EOF
+  iot_wizard_full
+  local rc=$?
+  if [[ $rc -eq 0 ]]; then
+    echo ""
+    ok "IoT device registration complete!"
+    echo ""
+    echo "  Next steps:"
+    echo "    • View registered devices at https://dev-app.qbit.me/iot"
+    echo "    • Attest endpoint export policies (Publish/Redact/Local-only)"
+    echo "    • Register more devices: ${PROGRAM_NAME} --finish-only --finish iot"
+  else
+    warn "IoT wizard did not complete. You can re-run: ${PROGRAM_NAME} --finish-only --finish iot"
+  fi
+}
+
 prompt_finish_path() {
   local choice="" attempt=0 normalized=""
   while [[ ${attempt} -lt 5 ]]; do
@@ -1084,10 +1396,11 @@ How do you want to finish setup?
 
   1) GUI  — guided browser setup UI
   2) CLI  — terminal setup with qbit-setup
-  3) Skip — I'll finish later
+  3) IoT  — register an IoT device (MQTT, HTTP REST, or Home Assistant)
+  4) Skip — I'll finish later
 
 EOF
-    printf 'Select [1/2/3]: '
+    printf 'Select [1/2/3/4]: '
     if ! read -r choice; then
       echo
       warn "No input; defaulting to Skip."
@@ -1141,6 +1454,7 @@ EOF
   case "${selected}" in
     gui) finish_gui ;;
     cli) finish_cli ;;
+    iot) finish_iot ;;
     skip) finish_skip ;;
     *)
       warn "Unknown finish path '${selected}'; printing instructions."
@@ -1172,7 +1486,9 @@ install_setup_examples() {
 
 main() {
   if [[ "${finish_only}" -eq 1 ]]; then
-    resolve_install_dir
+    # Finish-only mode: just run the finish path step.
+    # No need to resolve install dir or use sudo — the install is already done.
+    SUDO=""
     run_finish_path_step
     return 0
   fi
