@@ -1323,7 +1323,7 @@ import sys, json
 devices = json.load(sys.stdin)
 print(json.dumps(devices[${selected_index}]))
 " 2>/dev/null)
-  bridge_device_id=$(iot_api_get "/api/v1/diagnostics" | python3 -c "
+  bridge_device_id=$(iot_api_get "/api/v1/troubleshooting/diagnostics" | python3 -c "
 import sys, json
 try:
     d = json.load(sys.stdin)
