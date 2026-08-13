@@ -1308,16 +1308,14 @@ for i, d in enumerate(devices):
   echo ""
   echo "  ▶ Step 5: Register device"
   local selected_index=0
-  if [[ "$device_count" -gt 1 ]]; then
-    while true; do
-      printf '  Which device to register? [0-%d]: ' "$((device_count-1))"
-      read -r selected_index || true
-      if [[ "$selected_index" =~ ^[0-9]+$ ]] && [[ "$selected_index" -ge 0 ]] && [[ "$selected_index" -lt "$device_count" ]]; then
-        break
-      fi
-      warn "Invalid choice."
-    done
-  fi
+  while true; do
+    printf '  Which device to register? [0-%d]: ' "$((device_count-1))"
+    read -r selected_index || true
+    if [[ "$selected_index" =~ ^[0-9]+$ ]] && [[ "$selected_index" -ge 0 ]] && [[ "$selected_index" -lt "$device_count" ]]; then
+      break
+    fi
+    warn "Invalid choice. Enter 0-$((device_count-1))."
+  done
 
   local device_json bridge_device_id register_body
   device_json=$(echo "$devices_json" | python3 -c "
