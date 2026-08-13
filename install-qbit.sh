@@ -1387,7 +1387,7 @@ EOF
 prompt_finish_path() {
   local choice="" attempt=0 normalized=""
   while [[ ${attempt} -lt 5 ]]; do
-    cat <<EOF
+    cat >&2 <<EOF
 
 How do you want to finish setup?
 
@@ -1397,7 +1397,7 @@ How do you want to finish setup?
   4) Skip — I'll finish later
 
 EOF
-    printf 'Select [1/2/3/4]: '
+    printf 'Select [1/2/3/4]: ' >&2
     if ! read -r choice; then
       echo
       warn "No input; defaulting to Skip."
