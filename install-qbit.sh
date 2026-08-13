@@ -1005,23 +1005,19 @@ print_finish_instructions_all() {
   cat <<EOF
 How to finish setup later:
 
-  GUI  — open the guided browser setup UI:
-           http://${SETUP_BIND_ADDRESS}/
-         (or re-run: ${PROGRAM_NAME} --finish-only --finish gui)
+  Re-run the installer with no flags — it detects the existing install and
+  shows a menu:
 
-  CLI  — run the interactive setup wizard (same flow as the browser UI):
-           qbit-setup
-         The wizard remembers your progress — re-run anytime to continue,
-         resume after a failure, or follow an in-progress install.
-         (or re-run: ${PROGRAM_NAME} --finish-only --finish cli)
+    ${PROGRAM_NAME}
 
-  IoT  — register an IoT device (MQTT, HTTP REST, or Home Assistant):
-           ${PROGRAM_NAME} --finish-only --finish iot
-         Interactive wizard: choose protocol → configure → discover → register.
+  Then select "1) Finish setup" to choose:
 
-  Skip — host prep only; finish when ready with any path above.
+    GUI  — open the guided browser setup UI at http://${SETUP_BIND_ADDRESS}/
+    CLI  — run the interactive setup wizard (qbit-setup)
+    IoT  — register an IoT device (MQTT, HTTP REST, or Home Assistant)
+    Skip — finish later
 
-Automation: ${PROGRAM_NAME} -y --finish gui|cli|iot|skip
+  Automation: ${PROGRAM_NAME} -y --finish gui|cli|iot|skip
 EOF
 }
 
@@ -1381,9 +1377,9 @@ EOF
     echo "  Next steps:"
     echo "    • View registered devices at https://dev-app.qbit.me/iot"
     echo "    • Attest endpoint export policies (Publish/Redact/Local-only)"
-    echo "    • Register more devices: ${PROGRAM_NAME} --finish-only --finish iot"
+    echo "    • Register more devices: re-run this wizard (install-qbit.sh → Finish setup → IoT)"
   else
-    warn "IoT wizard did not complete. You can re-run: ${PROGRAM_NAME} --finish-only --finish iot"
+    warn "IoT wizard did not complete. Re-run: install-qbit.sh → Finish setup → IoT"
   fi
 }
 
