@@ -57,6 +57,7 @@ with_ble=0
 skip_hermes=0
 dry_run=0
 assume_yes=0
+FORCE_INTERACTIVE=0
 # finish path: empty = prompt when interactive; gui|cli|skip when set via --finish
 finish_path=""
 finish_only=0
@@ -1437,7 +1438,7 @@ run_finish_path_step() {
 EOF
 
   if [[ -z "${selected}" ]]; then
-    if [[ "${assume_yes}" -eq 1 ]] || ! is_interactive_tty; then
+    if [[ "${FORCE_INTERACTIVE}" -eq 0 ]] && { [[ "${assume_yes}" -eq 1 ]] || ! is_interactive_tty; }; then
       # Non-interactive: do not prompt and do not auto-pick from environment.
       echo
       print_finish_instructions_all
@@ -1512,6 +1513,11 @@ EOF
         fi
         case "${reinstall_choice}" in
           1|"")
+            # User already confirmed they're interactive by answering this menu.
+            # Force interactive mode in run_finish_path_step so the finish-path
+            # menu (GUI/CLI/IoT/Skip) appears even if is_interactive_tty fails.
+            finish_path=""
+            FORCE_INTERACTIVE=1
             run_finish_path_step
             return 0
             ;;
